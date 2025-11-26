@@ -1,5 +1,4 @@
 import re
-import subprocess
 import time
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -74,39 +73,14 @@ def convertNEFToTempPNG(nef_path: Path) -> Optional[Path]:
         return None
 
 
-def normalize_barcode_text(raw: Optional[str]) -> Optional[str]:
-    if not raw:
-        return None
-
-    raw = raw.strip()
-    if raw.isdigit():
-        return raw
-
-    digits = "".join(ch for ch in raw if ch.isdigit())
-    if not digits:
-        return None
-
-    return digits
-
-
-def sanitize_code_for_filename(code: str) -> str:
-    safe = re.sub(r"[^0-9A-Za-z._-]", "_", code)
-    safe = safe.lstrip("./\\")
-    if not safe:
-        safe = "barcode"
-    return safe
-
-
 def renameWithBarcodeForPair(
     barcode_img: Path, product_img: Path, code: str
 ) -> Tuple[Path, Path]:
     ext = barcode_img.suffix.lower()
     parent = barcode_img.parent
 
-    safe_code = sanitize_code_for_filename(code)
-
-    new_barcode = parent / f"{safe_code}_barcode{ext}"
-    new_product = parent / f"{safe_code}_product{ext}"
+    new_barcode = parent / f"{code}_barcode{ext}"
+    new_product = parent / f"{code}_product{ext}"
 
     print(f"[RENAME] {barcode_img.name} -> {new_barcode.name}")
     barcode_img = barcode_img.rename(new_barcode)
@@ -141,7 +115,7 @@ def processPair(barcode_img: Path, product_img: Path):
             return
 
         try:
-            raw_code = readBarcode_hf(tmp_png)
+            code = readBarcode_hf(tmp_png)
         finally:
             try:
                 tmp_png.unlink()
@@ -149,13 +123,11 @@ def processPair(barcode_img: Path, product_img: Path):
             except Exception:
                 pass
     else:
-        raw_code = readBarcode_hf(barcode_img)
+        code = readBarcode_hf(barcode_img)
 
-    code = normalize_barcode_text(raw_code)
-    if not code:
+    if not code or not code.isdigit():
         print(
-            "[BARCODE] Decoded text is not a valid numeric barcode "
-            f"(raw={raw_code!r}); marking pair as BAD"
+            f"[BARCODE] No valid numeric barcode detected (code={code!r}); marking pair as BAD"
         )
         move_pair_to_folder(barcode_img, product_img, bad_dir)
         return
@@ -180,11 +152,7 @@ def processInputFolderAsPairs():
         processPair(pair[0], pair[1])
 
 
-def main():
+if __name__ == "__main__":
     t0 = time.time()
     processInputFolderAsPairs()
     print(f"[TOTAL] Completed in {time.time() - t0:.2f}s")
-
-
-if __name__ == "__main__":
-    main()
