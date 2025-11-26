@@ -1,9 +1,6 @@
-# Barcode Changer (Mac-Friendly & Beginner-Friendly)
+# Barcode Changer
 
-Welcome!  
 This tool automatically **reads barcodes from images and renames the files for you**.  
-It is built specifically for **non-technical Mac users** who want something easy, safe, and fast — **no admin password required**.
-
 Everything below is written so you can simply **copy, paste, and follow along**.
 
 ---
@@ -16,9 +13,6 @@ When you run the command:
 - It reads your image files **two at a time**
 - It detects and reads the **barcodes**
 - It renames the images automatically based on the barcode values
-
-This is especially useful if you regularly handle large sets of product photos.
-
 ---
 
 # 💻 What You Need
