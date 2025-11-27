@@ -1,0 +1,11 @@
+README.md
+pyproject.toml
+barcode_changer.egg-info/PKG-INFO
+barcode_changer.egg-info/SOURCES.txt
+barcode_changer.egg-info/dependency_links.txt
+barcode_changer.egg-info/entry_points.txt
+barcode_changer.egg-info/requires.txt
+barcode_changer.egg-info/top_level.txt
+barcode_changer_tool/__init__.py
+barcode_changer_tool/barcode_changer.py
+barcode_changer_tool/barcode_reader.py

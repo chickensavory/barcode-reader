@@ -1,0 +1,8 @@
+opencv-python
+numpy
+huggingface_hub
+pyrxing
+ultralytics
+rawpy
+imageio
+zxing-cpp

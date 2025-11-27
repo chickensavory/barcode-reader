@@ -1,0 +1,2 @@
+[console_scripts]
+barcode-changer = barcode_changer_tool.barcode_changer:main
