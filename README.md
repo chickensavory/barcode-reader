@@ -1,5 +1,5 @@
 # Barcode Changer
-
+# Wait! May issue toh! Missing the main() function
 This tool automatically **reads barcodes from images and renames the files for you**.  
 Everything below is written so you can simply **copy, paste, and follow along**.
 
