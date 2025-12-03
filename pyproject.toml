@@ -21,12 +21,6 @@ dependencies = [
 
 [project.scripts]
 barcode-changer = "barcode_changer_tool.barcode_changer:main"
-
-# ✅ IMPORTANT:
-# Make sure BOTH packages are included in the built wheel:
-# - barcode_changer_tool (your CLI)
-# - barcode_reader (the module your CLI imports)
-
 [tool.setuptools]
 include-package-data = true
 
