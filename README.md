@@ -170,3 +170,4 @@ https://www.python.org/downloads/macos/
 * The tool expects a folder named **`input`** in your current directory.
 * Images are processed **two at a time** (pairs).
 * Keep a backup of your originals the first time you run it, just in case you want to revert.
+* If the product is more than 5, check if it actually is a new product (this is because this is using the shoot time as one of the reference of a new product and it might have been to close from the previous product.)
