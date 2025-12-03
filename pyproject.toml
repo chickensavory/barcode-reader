@@ -16,7 +16,7 @@ dependencies = [
   "ultralytics",
   "rawpy",
   "imageio",
-  "zxingcpp",
+  "zxing-cpp",
 ]
 
 [project.scripts]
