@@ -137,14 +137,6 @@ def listInputFiles() -> List[Path]:
     return files
 
 
-def readBarcodeRetry(path: Path, tries: int = 2) -> Optional[str]:
-    for _ in range(tries):
-        code = readBarcode_hf(str(path))
-        if code:
-            return code
-    return None
-
-
 def scanPhoto(path: Path) -> Photo:
     index = extractIndex(path)
     timestamp = getPhotoTimestamp(path)
@@ -165,7 +157,7 @@ def scanPhoto(path: Path) -> Photo:
             )
         scan_path = tmp_png
 
-    code: Optional[str] = readBarcodeRetry(scan_path, tries=2)
+    code: Optional[str] = readBarcode_hf(str(scan_path))
 
     if tmp_png is not None:
         try:
