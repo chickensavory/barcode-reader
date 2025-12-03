@@ -4,7 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from barcode_reader import readBarcode_hf
+from barcode_changer_tool.barcode_reader import readBarcode_hf
 
 for var in (
     "OMP_NUM_THREADS",
