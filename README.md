@@ -1,14 +1,13 @@
-make this in md format 
-
-````md
 # Barcode Reader
 
 This tool **reads barcodes from image files and renames the images for you**.  
 Everything below is meant to be **copy → paste → run** friendly (no admin needed).
 
+> **Command name:** This repo installs the command **`barcode-changer`**.
+
 ---
 
-## ✨ What It Does
+##  What It Does
 
 When you run the command, it:
 
@@ -20,7 +19,7 @@ When you run the command, it:
 
 ---
 
-## ✅ What You Need
+## What You Need
 
 - A Mac
 - **Python 3**
@@ -32,7 +31,7 @@ You do **not** need:
 
 ---
 
-## 📦 Installation
+## Installation
 
 ### 1) Open Terminal
 Press:
@@ -44,16 +43,47 @@ Press:
 > Note: On many Macs `pip` isn’t available as a command, so we use `python3 -m pip`.
 
 ```bash
+python3 -m pip install --user --upgrade pip
 python3 -m pip install --user "git+https://github.com/chickensavory/barcode-reader.git"
 ````
 
-### 3) Close Terminal, then reopen it
+### 3) Verify it installed (run the command)
 
-This helps your Mac “notice” newly installed commands.
+```bash
+barcode-changer
+```
+
+If you see an error like `command not found: barcode-changer`, do the one-time setup below.
+
+### 4) One-time setup (only if the command is “not found”)
+
+Sometimes macOS doesn’t automatically look in the folder where Python installs commands.
+
+Run:
+
+```bash
+python3 -m site --user-base
+```
+
+If it prints something like `/Users/YOURNAME/Library/Python/3.9`, then run:
+
+```bash
+echo 'export PATH="$HOME/Library/Python/3.9/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+hash -r
+```
+
+> If your path shows a different version (example: `3.10` or `3.11`), replace `3.9` above to match.
+
+Now try again:
+
+```bash
+barcode-changer
+```
 
 ---
 
-## 📸 How To Use (Step-by-Step)
+## How To Use (Step-by-Step)
 
 ### Step 1 — Make a working folder
 
@@ -84,7 +114,7 @@ Put images in the order you want processed—this tool reads them in pairs.
 From inside the folder that contains `input`, run:
 
 ```bash
-barcode-reader
+barcode-changer
 ```
 
 ### Step 5 — Done
@@ -93,12 +123,10 @@ Your files will be renamed and you’ll see status output in Terminal.
 
 ---
 
-## 🔄 Updating
-
-To pull the latest version from GitHub:
+## Updating
 
 ```bash
-python3 -m pip install --user --upgrade "git+https://github.com/chickensavory/barcode-reader.git"
+python3 -m pip install --user --upgrade --no-cache-dir "git+https://github.com/chickensavory/barcode-reader.git"
 ```
 
 ---
@@ -121,28 +149,9 @@ python3 -m pip install --user "git+https://github.com/chickensavory/barcode-read
 
 ---
 
-### Problem: `command not found: barcode-reader`
+### Problem: `command not found: barcode-changer`
 
-Your Mac may not have your user scripts folder on the PATH.
-
-Try running it directly:
-
-```bash
-python3 -m barcode_reader
-```
-
-If that works, add your user scripts folder to PATH by running:
-
-```bash
-echo 'export PATH="$HOME/Library/Python/3.*/bin:$PATH"' >> ~/.zshrc
-source ~/.zshrc
-```
-
-Close and reopen Terminal, then try:
-
-```bash
-barcode-reader
-```
+Follow the “One-time setup” step in **Installation** to add the Python user `bin` folder to your PATH.
 
 ---
 
@@ -156,7 +165,7 @@ https://www.python.org/downloads/macos/
 
 ---
 
-## 📁 Notes
+## Notes
 
 * The tool expects a folder named **`input`** in your current directory.
 * Images are processed **two at a time** (pairs).
