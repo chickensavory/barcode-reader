@@ -1,172 +1,111 @@
-# Barcode Changer
-This tool automatically **reads barcodes from images and renames the files for you**.  
-Everything below is written so you can simply **copy, paste, and follow along**.
+make this in md format 
+
+````md
+# Barcode Reader
+
+This tool **reads barcodes from image files and renames the images for you**.  
+Everything below is meant to be **copy → paste → run** friendly (no admin needed).
 
 ---
 
-# 🌟 What This Tool Does
+## ✨ What It Does
 
-When you run the command:
+When you run the command, it:
 
-- It looks for a folder named **input**
-- It reads your image files **two at a time**
-- It detects and reads the **barcodes**
-- It renames the images automatically based on the barcode values
----
-
-# 💻 What You Need
-
-- A Mac  
-- Python 3 installed (most Macs already have it)
-
-You **do NOT** need:
-
-- Admin or root access  
-- Coding or technical knowledge  
-- To install any apps  
-- To manage complicated settings  
+- Looks for a folder named **`input`**
+- Reads your image files **two at a time** (pairs)
+- Detects and reads the **barcodes**
+- Renames the images based on the barcode values
+- Prints progress in Terminal as it goes
 
 ---
 
-# 📦 Installation (No Admin Needed)
+## ✅ What You Need
 
-Follow these steps exactly:
+- A Mac
+- **Python 3**
+
+You do **not** need:
+- Admin/root access
+- Coding experience
+- Any extra apps
 
 ---
 
-## 1. Open Terminal
+## 📦 Installation
 
+### 1) Open Terminal
 Press:
 
 **⌘ + Space → type “Terminal” → press Enter**
 
----
+### 2) Install the tool (copy + paste)
 
-## 2. Install the tool (copy and paste this)
+> Note: On many Macs `pip` isn’t available as a command, so we use `python3 -m pip`.
 
 ```bash
-pip install --user "git+https://github.com/chickensavory/barcode-changer.git"
-```
+python3 -m pip install --user "git+https://github.com/chickensavory/barcode-reader.git"
+````
 
-This installs the tool **for your user only** — safe and simple.
+### 3) Close Terminal, then reopen it
 
----
-
-## 3. Close Terminal, then reopen it
-
-This step is important so the command becomes available.
+This helps your Mac “notice” newly installed commands.
 
 ---
 
-# 📸 How To Use the Tool (Step-by-Step)
+## 📸 How To Use (Step-by-Step)
 
----
+### Step 1 — Make a working folder
 
-## Step 1 — Create a working folder
-
-You can name it anything. Example:
+You can name it anything:
 
 ```bash
 mkdir barcode_work
 cd barcode_work
 ```
 
----
-
-## Step 2 — Make an `input` folder inside it
+### Step 2 — Create an `input` folder
 
 ```bash
 mkdir input
 ```
 
-This `input` folder must contain the images you want processed.
-
----
-
-## Step 3 — Add your image files
+### Step 3 — Add your image files
 
 Using Finder:
 
-1. Open your `barcode_work` folder  
+1. Open your `barcode_work` folder
 2. Drag your images into the `input` folder
 
-No special formatting required — just put your image pairs in there.
+Put images in the order you want processed—this tool reads them in pairs.
+
+### Step 4 — Run the tool
+
+From inside the folder that contains `input`, run:
+
+```bash
+barcode-reader
+```
+
+### Step 5 — Done
+
+Your files will be renamed and you’ll see status output in Terminal.
 
 ---
 
-## Step 4 — Run the tool
+## 🔄 Updating
 
-Make sure you are still in your working folder (the one **containing** the `input` folder), then run:
+To pull the latest version from GitHub:
 
 ```bash
-barcode-changer
+python3 -m pip install --user --upgrade "git+https://github.com/chickensavory/barcode-reader.git"
 ```
 
 ---
 
-## Step 5 — Watch it work!
+## 🧯 Troubleshooting
 
-The tool will:
-
-- Detect barcodes  
-- Process your images in pairs  
-- Rename them  
-- Print progress in Terminal  
-
-Your renamed files will appear in the same folder.
-
----
-
-# 🧪 Complete Example (From Scratch)
-
-Let’s pretend you are starting fresh.
-
-1. Create a folder on your Desktop named **photos**  
-2. Inside **photos**, create a folder named **input**  
-3. Drag all your RAW/JPG images into **input**  
-4. Open Terminal and run:
-
-```bash
-cd ~/Desktop/photos
-barcode-changer
-```
-
-5. The tool renames your files based on detected barcodes  
-6. You’re done 🎉
-
----
-
-# 🔄 Updating the Tool
-
-If a new version is published later, update easily:
-
-```bash
-pip install --user --upgrade "git+https://github.com/chickensavory/barcode-changer.git"
-```
-
----
-
-# ❗ Troubleshooting & Fixes
-
----
-
-### Problem: “command not found: barcode-changer”
-
-Try this:
-
-1. Close Terminal  
-2. Reopen Terminal  
-3. Try running `barcode-changer` again
-
-If still failing, run:
-
-```bash
-python3 -m pip install --user "git+https://github.com/chickensavory/barcode-changer.git"
-```
-
----
-
-### Problem: “pip: command not found”
+### Problem: `pip` not found
 
 Run:
 
@@ -174,16 +113,51 @@ Run:
 python3 -m ensurepip --upgrade
 ```
 
-Then try the installation command again.
+Then install again:
+
+```bash
+python3 -m pip install --user "git+https://github.com/chickensavory/barcode-reader.git"
+```
+
+---
+
+### Problem: `command not found: barcode-reader`
+
+Your Mac may not have your user scripts folder on the PATH.
+
+Try running it directly:
+
+```bash
+python3 -m barcode_reader
+```
+
+If that works, add your user scripts folder to PATH by running:
+
+```bash
+echo 'export PATH="$HOME/Library/Python/3.*/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+Close and reopen Terminal, then try:
+
+```bash
+barcode-reader
+```
 
 ---
 
 ### Problem: You don’t have Python 3
 
-Download it here (official site):
+Install Python 3 from the official site, then reopen Terminal:
 
+```text
 https://www.python.org/downloads/macos/
-
-Restart Terminal after installing.
+```
 
 ---
+
+## 📁 Notes
+
+* The tool expects a folder named **`input`** in your current directory.
+* Images are processed **two at a time** (pairs).
+* Keep a backup of your originals the first time you run it, just in case you want to revert.
