@@ -2,7 +2,6 @@ import os
 import tempfile
 from pathlib import Path
 from typing import Optional, Union
-
 import cv2
 import numpy as np
 from huggingface_hub import hf_hub_download
@@ -175,6 +174,7 @@ def brute_force_full_image(img_bgr: np.ndarray) -> Optional[str]:
 
     if not zx_votes and not pyr_votes:
         return None
+
     if len(zx_votes) == 1:
         ((candidate, count),) = zx_votes.items()
         conflicts = [c for c in pyr_votes.keys() if c != candidate]
