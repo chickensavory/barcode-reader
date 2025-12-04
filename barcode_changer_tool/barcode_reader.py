@@ -1,13 +1,10 @@
-import os
-import tempfile
+import os, tempfile, cv2, numpy as np, zxingcpp
+from enum import Enum
 from pathlib import Path
 from typing import Optional, Union
-import cv2
-import numpy as np
 from huggingface_hub import hf_hub_download
 from ultralytics import YOLO
 from pyrxing import read_barcode
-import zxingcpp
 
 
 weights = hf_hub_download(
@@ -15,6 +12,12 @@ weights = hf_hub_download(
     filename="YOLOV8s_Barcode_Detection.pt",
 )
 YOLO_MODEL = YOLO(weights)
+
+
+class BarcodeStatus(str, Enum):
+    BARCODE = "BARCODE"
+    NONBARCODE = "NONBARCODE"
+    UNSURE = "UNSURE"
 
 
 def extract_upc_candidate(text: str) -> Optional[str]:
@@ -85,6 +88,7 @@ def decode_with_pyrxing_from_array(img_bgr: np.ndarray) -> Optional[str]:
     if img_bgr is None or img_bgr.size == 0:
         return None
     enhanced = enhance_for_pyrxing(img_bgr)
+
     tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
     tmp_path = tmp.name
     tmp.close()
@@ -100,8 +104,7 @@ def decode_with_pyrxing_from_array(img_bgr: np.ndarray) -> Optional[str]:
                     return candidate
                 else:
                     print(
-                        f"[BARCODE] pyrxing candidate failed checksum: "
-                        f"{raw} -> {candidate}"
+                        f"[BARCODE] pyrxing candidate failed checksum: {raw} -> {candidate}"
                     )
         return None
     finally:
@@ -114,7 +117,6 @@ def decode_with_pyrxing_from_array(img_bgr: np.ndarray) -> Optional[str]:
 def decode_with_zxing(img_bgr: np.ndarray) -> Optional[str]:
     if img_bgr is None or img_bgr.size == 0:
         return None
-
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     results = zxingcpp.read_barcodes(gray)
     if not results:
@@ -131,8 +133,7 @@ def decode_with_zxing(img_bgr: np.ndarray) -> Optional[str]:
                 return candidate
             else:
                 print(
-                    f"[BARCODE] ZXing candidate failed checksum: "
-                    f"{raw} -> {candidate}"
+                    f"[BARCODE] ZXing candidate failed checksum: {raw} -> {candidate}"
                 )
     return None
 
@@ -168,38 +169,35 @@ def brute_force_full_image(img_bgr: np.ndarray) -> Optional[str]:
 
         if code_pyr or code_zx:
             print(
-                f"[BARCODE] Full-image partial at {angle}°: "
-                f"pyr={code_pyr}, zxing={code_zx}"
+                f"[BARCODE] Full-image partial at {angle}°: pyr={code_pyr}, zxing={code_zx}"
             )
 
     if not zx_votes and not pyr_votes:
         return None
 
-    if len(zx_votes) == 1:
-        ((candidate, count),) = zx_votes.items()
-        conflicts = [c for c in pyr_votes.keys() if c != candidate]
-
-        if not conflicts and is_valid_upc_ean(candidate):
-            print(
-                f"[BARCODE] Full-image ZXing-only consensus: "
-                f"{candidate} with {count} vote(s)"
-            )
+    if zx_votes:
+        candidate, count = max(zx_votes.items(), key=lambda kv: kv[1])
+        pyr_conflicts = [c for c in pyr_votes.keys() if c != candidate]
+        if (count >= 2 or not pyr_conflicts) and is_valid_upc_ean(candidate):
+            print(f"[BARCODE] Accepting ZXing winner: {candidate} ({count} vote(s))")
             return candidate
 
     print(f"[BARCODE] Full-image votes inconclusive: zx={zx_votes}, pyr={pyr_votes}")
     return None
 
 
-def readBarcode_hf(image_path: Union[str, Path]) -> Optional[str]:
+def readBarcode_hf_status(
+    image_path: Union[str, Path],
+) -> tuple[BarcodeStatus, Optional[str]]:
     image_path = str(image_path)
     img = cv2.imread(image_path)
     if img is None:
         print(f"[BARCODE] Cannot read {image_path}")
-        return None
+        return BarcodeStatus.NONBARCODE, None
 
     code = brute_force_full_image(img)
     if code:
-        return code
+        return BarcodeStatus.BARCODE, code
 
     print("[BARCODE] Full-image strict read failed, trying YOLO crops...")
 
@@ -207,13 +205,12 @@ def readBarcode_hf(image_path: Union[str, Path]) -> Optional[str]:
         results = YOLO_MODEL.predict(image_path, conf=0.05, verbose=False)[0]
     except Exception as e:
         print("[BARCODE] YOLO error:", e)
-        return None
+        return BarcodeStatus.UNSURE, None
 
     boxes = results.boxes
     if boxes is None or len(boxes) == 0:
-        print("[BARCODE] YOLO found no regions in strict mode.")
-        print("[BARCODE] No UPC/EAN found.")
-        return None
+        print("[BARCODE] YOLO found no regions.")
+        return BarcodeStatus.NONBARCODE, None
 
     confs = boxes.conf.cpu().numpy()
     xyxy = boxes.xyxy.cpu().numpy().astype(int)
@@ -224,24 +221,27 @@ def readBarcode_hf(image_path: Union[str, Path]) -> Optional[str]:
         x1, y1, x2, y2 = xyxy[idx]
         bw = max(1, x2 - x1)
         bh = max(1, y2 - y1)
-        pad_x = max(10, int(0.2 * bw))
+
+        pad_x = max(30, int(0.6 * bw))
         pad_y = max(10, int(0.2 * bh))
+
         x1p = max(0, x1 - pad_x)
         y1p = max(0, y1 - pad_y)
         x2p = min(w, x2 + pad_x)
         y2p = min(h, y2 + pad_y)
+
         crop = img[y1p:y2p, x1p:x2p]
         if crop.size == 0:
             continue
 
         crop_big = cv2.resize(crop, None, fx=3.5, fy=3.5, interpolation=cv2.INTER_CUBIC)
         print(
-            f"[BARCODE] Trying YOLO crop {idx} conf={confs[idx]:.3f}, "
-            f"size={crop_big.shape[1]}x{crop_big.shape[0]}"
+            f"[BARCODE] Trying YOLO crop {idx} conf={confs[idx]:.3f}, size={crop_big.shape[1]}x{crop_big.shape[0]}"
         )
 
         ch, cw = crop_big.shape[:2]
         center = (cw // 2, ch // 2)
+
         for angle in [0, 90, -90, 45, -45]:
             if angle == 0:
                 rotated = crop_big
@@ -254,16 +254,29 @@ def readBarcode_hf(image_path: Union[str, Path]) -> Optional[str]:
 
             if code_pyr and code_zx and code_pyr == code_zx:
                 print(
-                    f"[BARCODE] STRICT YOLO match (box {idx}, angle {angle}°): "
-                    f"{code_pyr}"
+                    f"[BARCODE] STRICT YOLO match (box {idx}, angle {angle}°): {code_pyr}"
                 )
-                return code_pyr
+                return BarcodeStatus.BARCODE, code_pyr
+            if code_zx and is_valid_upc_ean(code_zx):
+                print(
+                    f"[BARCODE] YOLO accept ZXing (box {idx}, angle {angle}°): {code_zx}"
+                )
+                return BarcodeStatus.BARCODE, code_zx
+            if code_pyr and is_valid_upc_ean(code_pyr):
+                print(
+                    f"[BARCODE] YOLO accept pyrxing (box {idx}, angle {angle}°): {code_pyr}"
+                )
+                return BarcodeStatus.BARCODE, code_pyr
 
             if code_pyr or code_zx:
                 print(
-                    f"[BARCODE] YOLO box {idx} angle {angle}° mismatch: "
-                    f"pyr={code_pyr}, zxing={code_zx}"
+                    f"[BARCODE] YOLO box {idx} angle {angle}° mismatch: pyr={code_pyr}, zxing={code_zx}"
                 )
 
-    print("[BARCODE] No STRICT UPC/EAN found after full-image + YOLO.")
-    return None
+    print("[BARCODE] Barcode-like regions found but no valid decode.")
+    return BarcodeStatus.UNSURE, None
+
+
+def readBarcode_hf(image_path: Union[str, Path]) -> Optional[str]:
+    status, code = readBarcode_hf_status(image_path)
+    return code if status == BarcodeStatus.BARCODE else None
