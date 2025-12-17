@@ -2,9 +2,11 @@ import re, os, subprocess, time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from barcode_changer_tool.barcode_reader import readBarcode_hf
+from bisect import bisect_left
+
+from barcode_reader import readBarcode_hf_status, BarcodeStatus
 
 for var in (
     "OMP_NUM_THREADS",
@@ -19,6 +21,7 @@ try:
     from PIL import Image
 except ImportError:
     Image = None
+
 INPUT_DIR = Path("input")
 GOOD_DIR = Path("good")
 BAD_DIR = Path("bad")
@@ -37,14 +40,10 @@ SUPPORTED_EXTS = {
     ".cr3",
 }
 
-RAW_EXTS = {
-    ".nef",
-    ".arw",
-    ".cr2",
-    ".cr3",
-}
+RAW_EXTS = {".nef", ".arw", ".cr2", ".cr3"}
 
-CHUNK_GAP_SEC = 80.0
+RESET_GAP_SEC = 120.0
+MAX_ASSIGN_SEC = 90.0
 
 MAX_WORKERS = min(8, (os.cpu_count() or 4))
 
@@ -56,6 +55,7 @@ class Photo:
     index: int
     code: Optional[str]
     is_barcode: bool
+    is_unsure: bool = False
 
 
 @dataclass
@@ -76,8 +76,7 @@ def sanitizeBarcodeForFileName(barcode_text: str) -> str:
 
 
 def convertRawToTempPNG(raw_path: Path) -> Optional[Path]:
-    suffix = raw_path.suffix.lower()
-    if suffix not in RAW_EXTS:
+    if raw_path.suffix.lower() not in RAW_EXTS:
         return None
 
     tmp_png = raw_path.with_suffix(".barcode_tmp.png")
@@ -99,7 +98,6 @@ def convertRawToTempPNG(raw_path: Path) -> Optional[Path]:
         print(f"[RAW] ERROR: temp PNG missing after conversion of {raw_path.name}")
         return None
 
-    print(f"[RAW] Temp PNG created: {tmp_png.name}")
     return tmp_png
 
 
@@ -130,11 +128,11 @@ def listInputFiles() -> List[Path]:
     if not INPUT_DIR.exists():
         print("[ERROR] input folder missing")
         return []
-    files: List[Path] = []
-    for p in INPUT_DIR.iterdir():
-        if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS:
-            files.append(p)
-    return files
+    return [
+        p
+        for p in INPUT_DIR.iterdir()
+        if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS
+    ]
 
 
 def scanPhoto(path: Path) -> Photo:
@@ -154,19 +152,19 @@ def scanPhoto(path: Path) -> Photo:
                 index=index,
                 code=None,
                 is_barcode=False,
+                is_unsure=False,
             )
         scan_path = tmp_png
 
-    code: Optional[str] = readBarcode_hf(str(scan_path))
+    status, code = readBarcode_hf_status(str(scan_path))
 
     if tmp_png is not None:
         try:
             tmp_png.unlink()
-            print(f"[RAW] Deleted temp PNG {tmp_png.name}")
         except Exception:
             pass
 
-    if code:
+    if status == BarcodeStatus.BARCODE and code:
         print(f"[SCAN] {path.name}: BARCODE {code}")
         return Photo(
             path=path,
@@ -174,16 +172,28 @@ def scanPhoto(path: Path) -> Photo:
             index=index,
             code=code,
             is_barcode=True,
+            is_unsure=False,
         )
-    else:
-        print(f"[SCAN] {path.name}: no barcode")
+
+    if status == BarcodeStatus.UNSURE:
+        print(f"[SCAN] {path.name}: UNSURE")
         return Photo(
             path=path,
             timestamp=timestamp,
             index=index,
             code=None,
             is_barcode=False,
+            is_unsure=True,
         )
+
+    return Photo(
+        path=path,
+        timestamp=timestamp,
+        index=index,
+        code=None,
+        is_barcode=False,
+        is_unsure=False,
+    )
 
 
 def scanAndClassifyPhotos(max_workers: int = MAX_WORKERS) -> List[Photo]:
@@ -193,8 +203,6 @@ def scanAndClassifyPhotos(max_workers: int = MAX_WORKERS) -> List[Photo]:
         return []
 
     print(f"[INFO] Found {len(files)} file(s). Scanning for barcodes...")
-    print(f"[INFO] Using up to {max_workers} worker thread(s).")
-
     photos: List[Photo] = []
 
     def _worker(p: Path) -> Photo:
@@ -209,66 +217,87 @@ def scanAndClassifyPhotos(max_workers: int = MAX_WORKERS) -> List[Photo]:
                 index=extractIndex(p),
                 code=None,
                 is_barcode=False,
+                is_unsure=False,
             )
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_path = {executor.submit(_worker, p): p for p in files}
-        total = len(future_to_path)
-        for i, future in enumerate(as_completed(future_to_path), start=1):
-            p = future_to_path[future]
-            photo = future.result()
-            photos.append(photo)
-            print(f"[INFO] Finished {i}/{total}: {p.name}")
+        futures = {executor.submit(_worker, p): p for p in files}
+        for i, fut in enumerate(as_completed(futures), start=1):
+            photos.append(fut.result())
+            if i % 10 == 0 or i == len(futures):
+                print(f"[INFO] Scanned {i}/{len(futures)}")
 
     photos.sort(key=lambda ph: (ph.timestamp, ph.index))
     return photos
 
 
-def chunk_photos_by_time(photos: List[Photo]) -> List[List[Photo]]:
+def chunk_by_reset_gap(photos: List[Photo]) -> List[List[Photo]]:
     if not photos:
         return []
-
     chunks: List[List[Photo]] = []
-    current_chunk: List[Photo] = [photos[0]]
-
-    for prev, curr in zip(photos, photos[1:]):
-        gap = (curr.timestamp - prev.timestamp).total_seconds()
-        if gap > CHUNK_GAP_SEC:
-            chunks.append(current_chunk)
-            current_chunk = [curr]
+    cur = [photos[0]]
+    for prev, nxt in zip(photos, photos[1:]):
+        gap = (nxt.timestamp - prev.timestamp).total_seconds()
+        if gap > RESET_GAP_SEC:
+            chunks.append(cur)
+            cur = [nxt]
         else:
-            current_chunk.append(curr)
-
-    chunks.append(current_chunk)
+            cur.append(nxt)
+    chunks.append(cur)
     return chunks
 
 
-def buildSessionsFromChunk(chunk: List[Photo]) -> List[Session]:
-    sessions: List[Session] = []
-    current: Optional[Session] = None
-    seen_barcode_in_chunk = False
+def _nearest_anchor_index(anchor_times: List[float], t: float) -> Optional[int]:
+    if not anchor_times:
+        return None
+    j = bisect_left(anchor_times, t)
+    if j == 0:
+        return 0
+    if j >= len(anchor_times):
+        return len(anchor_times) - 1
+    if abs(t - anchor_times[j - 1]) <= abs(anchor_times[j] - t):
+        return j - 1
+    return j
 
-    for ph in chunk:
-        if ph.is_barcode and ph.code:
-            if current is None or ph.code != current.code:
-                current = Session(code=ph.code, barcode_photos=[], other_photos=[])
-                sessions.append(current)
-            current.barcode_photos.append(ph)
-            seen_barcode_in_chunk = True
-        else:
-            if not seen_barcode_in_chunk:
+
+def buildSessions_nearest(photos: List[Photo]) -> List[Session]:
+    sessions: List[Session] = []
+
+    for block in chunk_by_reset_gap(photos):
+        anchors = [ph for ph in block if ph.is_barcode and ph.code]
+        if not anchors:
+            for ph in block:
+                moveToBad(ph.path)
+            continue
+
+        anchor_times = [a.timestamp.timestamp() for a in anchors]
+        anchor_to_session: Dict[int, Session] = {
+            i: Session(
+                code=anchors[i].code or "barcode",
+                barcode_photos=[anchors[i]],
+                other_photos=[],
+            )
+            for i in range(len(anchors))
+        }
+
+        for ph in block:
+            if ph.is_barcode and ph.code:
                 continue
-            if current is not None:
-                current.other_photos.append(ph)
 
-    return sessions
+            t = ph.timestamp.timestamp()
+            k = _nearest_anchor_index(anchor_times, t)
+            if k is None:
+                moveToBad(ph.path)
+                continue
 
+            dt = abs(t - anchor_times[k])
+            if dt <= MAX_ASSIGN_SEC:
+                anchor_to_session[k].other_photos.append(ph)
+            else:
+                moveToBad(ph.path)
 
-def buildSessions(photos: List[Photo]) -> List[Session]:
-    chunks = chunk_photos_by_time(photos)
-    sessions: List[Session] = []
-    for chunk in chunks:
-        sessions.extend(buildSessionsFromChunk(chunk))
+        sessions.extend(anchor_to_session.values())
+
     return sessions
 
 
@@ -285,14 +314,16 @@ def moveToBad(path: Path):
 
 def processSession(session: Session):
     GOOD_DIR.mkdir(parents=True, exist_ok=True)
+
     sanitized = sanitizeBarcodeForFileName(session.code)
 
     for idx, ph in enumerate(session.barcode_photos, start=1):
         suffix = ph.path.suffix.lower()
-        if len(session.barcode_photos) == 1:
-            base = f"{sanitized}_barcode"
-        else:
-            base = f"{sanitized}_barcode_{idx}"
+        base = (
+            f"{sanitized}_barcode"
+            if len(session.barcode_photos) == 1
+            else f"{sanitized}_barcode_{idx}"
+        )
         dest = GOOD_DIR / f"{base}{suffix}"
         n = 1
         while dest.exists():
@@ -313,38 +344,23 @@ def processSession(session: Session):
         ph.path.rename(dest)
 
 
-def processUnassignedPhotos(photos: List[Photo], sessions: List[Session]):
-    session_paths = {
-        ph.path for s in sessions for ph in (s.barcode_photos + s.other_photos)
-    }
-    for ph in photos:
-        if ph.path not in session_paths:
-            print(f"[ORPHAN] {ph.path.name} has no associated barcode; moving to bad/")
-            moveToBad(ph.path)
-
-
 def main():
     t0 = time.time()
     photos = scanAndClassifyPhotos()
     if not photos:
         return
 
-    sessions = buildSessions(photos)
+    sessions = buildSessions_nearest(photos)
     print(f"[INFO] Built {len(sessions)} session(s).")
 
     for s in sessions:
         print(
-            f"[SESSION] {s.code}: "
-            f"{len(s.barcode_photos)} barcode image(s), "
-            f"{len(s.other_photos)} other image(s)"
+            f"[SESSION] {s.code}: {len(s.barcode_photos)} barcode, {len(s.other_photos)} other"
         )
         processSession(s)
 
-    processUnassignedPhotos(photos, sessions)
     print(f"[TOTAL] Completed in {time.time() - t0:.2f}s")
 
 
 if __name__ == "__main__":
     main()
-
-# TODO skip images with no product and too blurry images

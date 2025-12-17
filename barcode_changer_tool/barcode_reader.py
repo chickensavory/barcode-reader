@@ -1,10 +1,16 @@
-import os, tempfile, cv2, numpy as np, zxingcpp
+import os
+import re
+import tempfile
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, Union, Dict, Set, Tuple
+
+import cv2
+import numpy as np
 from huggingface_hub import hf_hub_download
 from ultralytics import YOLO
 from pyrxing import read_barcode
+import zxingcpp
 
 
 weights = hf_hub_download(
@@ -20,12 +26,36 @@ class BarcodeStatus(str, Enum):
     UNSURE = "UNSURE"
 
 
+MIN_VOTES_TO_ACCEPT = 3
+
+REQUIRE_BOTH_DECODERS = True
+MIN_MARGIN_OVER_RUNNER_UP = 2
+
+MAX_YOLO_BOXES = 6
+
+ANGLES = [0, 90, -90, 45, -45]
+
+
 def extract_upc_candidate(text: str) -> Optional[str]:
     if not text:
         return None
-    digits = "".join(ch for ch in text if ch.isdigit())
-    if len(digits) in (8, 12, 13, 14):
-        return digits
+
+    raw = text.strip()
+    if not raw:
+        return None
+
+    m = re.search(r"\(01\)\s*(\d{14})", raw)
+    if m:
+        return m.group(1)
+
+    m = re.search(r"(?:\]C1|\]d2|\]Q3)?\s*01\s*(\d{14})", raw)
+    if m:
+        return m.group(1)
+
+    cleaned = raw.replace(" ", "").replace("-", "")
+    if cleaned.isdigit() and len(cleaned) in (8, 12, 13, 14):
+        return cleaned
+
     return None
 
 
@@ -62,6 +92,23 @@ def _ean8_checksum_ok(code: str) -> bool:
     return check == digits[7]
 
 
+def _gtin14_checksum_ok(code: str) -> bool:
+    if len(code) != 14 or not code.isdigit():
+        return False
+
+    digits = [int(c) for c in code]
+    body = digits[:-1]
+    check_digit = digits[-1]
+
+    total = 0
+    for i, d in enumerate(reversed(body), start=1):
+        weight = 3 if (i % 2 == 1) else 1
+        total += d * weight
+
+    check = (10 - (total % 10)) % 10
+    return check == check_digit
+
+
 def is_valid_upc_ean(code: str) -> bool:
     if not code or not code.isdigit():
         return False
@@ -71,7 +118,9 @@ def is_valid_upc_ean(code: str) -> bool:
         return _ean13_checksum_ok(code)
     if len(code) == 8:
         return _ean8_checksum_ok(code)
-    return len(code) == 14
+    if len(code) == 14:
+        return _gtin14_checksum_ok(code)
+    return False
 
 
 def enhance_for_pyrxing(img_bgr: np.ndarray) -> np.ndarray:
@@ -87,6 +136,7 @@ def enhance_for_pyrxing(img_bgr: np.ndarray) -> np.ndarray:
 def decode_with_pyrxing_from_array(img_bgr: np.ndarray) -> Optional[str]:
     if img_bgr is None or img_bgr.size == 0:
         return None
+
     enhanced = enhance_for_pyrxing(img_bgr)
 
     tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
@@ -98,14 +148,9 @@ def decode_with_pyrxing_from_array(img_bgr: np.ndarray) -> Optional[str]:
         if result and result.text:
             raw = result.text.strip()
             candidate = extract_upc_candidate(raw)
-            if candidate:
-                if is_valid_upc_ean(candidate):
-                    print(f"[BARCODE] pyrxing decoded candidate: {raw} -> {candidate}")
-                    return candidate
-                else:
-                    print(
-                        f"[BARCODE] pyrxing candidate failed checksum: {raw} -> {candidate}"
-                    )
+            if candidate and is_valid_upc_ean(candidate):
+                print(f"[BARCODE] pyrxing decoded: {raw} -> {candidate}")
+                return candidate
         return None
     finally:
         try:
@@ -117,6 +162,7 @@ def decode_with_pyrxing_from_array(img_bgr: np.ndarray) -> Optional[str]:
 def decode_with_zxing(img_bgr: np.ndarray) -> Optional[str]:
     if img_bgr is None or img_bgr.size == 0:
         return None
+
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     results = zxingcpp.read_barcodes(gray)
     if not results:
@@ -127,63 +173,90 @@ def decode_with_zxing(img_bgr: np.ndarray) -> Optional[str]:
         if not raw:
             continue
         candidate = extract_upc_candidate(raw)
-        if candidate:
-            if is_valid_upc_ean(candidate):
-                print(f"[BARCODE] ZXing decoded candidate: {raw} -> {candidate}")
-                return candidate
-            else:
-                print(
-                    f"[BARCODE] ZXing candidate failed checksum: {raw} -> {candidate}"
-                )
+        if candidate and is_valid_upc_ean(candidate):
+            print(f"[BARCODE] ZXing decoded: {raw} -> {candidate}")
+            return candidate
+
     return None
 
 
-def brute_force_full_image(img_bgr: np.ndarray) -> Optional[str]:
-    if img_bgr is None:
-        return None
-
+def _rotate(img_bgr: np.ndarray, angle: int) -> np.ndarray:
+    if angle == 0:
+        return img_bgr
     h, w = img_bgr.shape[:2]
     center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    return cv2.warpAffine(img_bgr, M, (w, h))
 
-    zx_votes: dict[str, int] = {}
-    pyr_votes: dict[str, int] = {}
 
-    for angle in [0, 90, -90, 45, -45]:
-        if angle == 0:
-            rotated = img_bgr
-        else:
-            M = cv2.getRotationMatrix2D(center, angle, 1.0)
-            rotated = cv2.warpAffine(img_bgr, M, (w, h))
+def _add_vote(
+    votes: Dict[str, int],
+    sources: Dict[str, Set[str]],
+    code: str,
+    src: str,
+    n: int = 1,
+):
+    votes[code] = votes.get(code, 0) + n
+    if code not in sources:
+        sources[code] = set()
+    sources[code].add(src)
+
+
+def _pick_winner(
+    votes: Dict[str, int],
+    sources: Dict[str, Set[str]],
+) -> Tuple[Optional[str], str]:
+    if not votes:
+        return None, "no_votes"
+
+    ranked = sorted(votes.items(), key=lambda kv: kv[1], reverse=True)
+    winner, wv = ranked[0]
+    runner_up = ranked[1][1] if len(ranked) > 1 else 0
+
+    if wv < MIN_VOTES_TO_ACCEPT:
+        return None, f"winner_has_{wv}_votes_lt_{MIN_VOTES_TO_ACCEPT}"
+
+    if (wv - runner_up) < MIN_MARGIN_OVER_RUNNER_UP:
+        return None, f"too_close_winner_{wv}_runnerup_{runner_up}"
+
+    if REQUIRE_BOTH_DECODERS:
+        srcs = sources.get(winner, set())
+        if not ("zx" in srcs and "pyr" in srcs):
+            return None, f"winner_missing_both_decoders_sources={sorted(list(srcs))}"
+
+    return winner, "accepted"
+
+
+def _vote_from_image(
+    img_bgr: np.ndarray, label: str
+) -> Tuple[Dict[str, int], Dict[str, Set[str]]]:
+    votes: Dict[str, int] = {}
+    sources: Dict[str, Set[str]] = {}
+
+    if img_bgr is None or img_bgr.size == 0:
+        return votes, sources
+
+    for angle in ANGLES:
+        rotated = _rotate(img_bgr, angle)
 
         code_pyr = decode_with_pyrxing_from_array(rotated)
         code_zx = decode_with_zxing(rotated)
 
         if code_pyr and code_zx and code_pyr == code_zx:
-            print(f"[BARCODE] STRICT full-image match at {angle}°: {code_pyr}")
-            return code_pyr
+            print(f"[BARCODE] {label}: match at {angle}° => {code_zx} (2 votes)")
+            _add_vote(votes, sources, code_zx, "zx", n=1)
+            _add_vote(votes, sources, code_pyr, "pyr", n=1)
+            continue
 
         if code_zx:
-            zx_votes[code_zx] = zx_votes.get(code_zx, 0) + 1
+            print(f"[BARCODE] {label}: zx at {angle}° => {code_zx}")
+            _add_vote(votes, sources, code_zx, "zx", n=1)
+
         if code_pyr:
-            pyr_votes[code_pyr] = pyr_votes.get(code_pyr, 0) + 1
+            print(f"[BARCODE] {label}: pyr at {angle}° => {code_pyr}")
+            _add_vote(votes, sources, code_pyr, "pyr", n=1)
 
-        if code_pyr or code_zx:
-            print(
-                f"[BARCODE] Full-image partial at {angle}°: pyr={code_pyr}, zxing={code_zx}"
-            )
-
-    if not zx_votes and not pyr_votes:
-        return None
-
-    if zx_votes:
-        candidate, count = max(zx_votes.items(), key=lambda kv: kv[1])
-        pyr_conflicts = [c for c in pyr_votes.keys() if c != candidate]
-        if (count >= 2 or not pyr_conflicts) and is_valid_upc_ean(candidate):
-            print(f"[BARCODE] Accepting ZXing winner: {candidate} ({count} vote(s))")
-            return candidate
-
-    print(f"[BARCODE] Full-image votes inconclusive: zx={zx_votes}, pyr={pyr_votes}")
-    return None
+    return votes, sources
 
 
 def readBarcode_hf_status(
@@ -195,29 +268,57 @@ def readBarcode_hf_status(
         print(f"[BARCODE] Cannot read {image_path}")
         return BarcodeStatus.NONBARCODE, None
 
-    code = brute_force_full_image(img)
-    if code:
-        return BarcodeStatus.BARCODE, code
+    votes_all: Dict[str, int] = {}
+    sources_all: Dict[str, Set[str]] = {}
 
-    print("[BARCODE] Full-image strict read failed, trying YOLO crops...")
+    votes, sources = _vote_from_image(img, label="full")
+    for c, n in votes.items():
+        _add_vote(votes_all, sources_all, c, src="seed", n=0)
+        votes_all[c] = votes_all.get(c, 0) + n
+        sources_all[c] |= sources.get(c, set())
+
+    winner, reason = _pick_winner(votes_all, sources_all)
+    if winner:
+        print(
+            f"[BARCODE] ACCEPT full-image winner: {winner} ({votes_all[winner]} votes) reason={reason}"
+        )
+        return BarcodeStatus.BARCODE, winner
+
+    if votes_all:
+        print(
+            f"[BARCODE] Full-image votes present but not accepted: reason={reason}, votes={votes_all}"
+        )
+
+    print("[BARCODE] Full-image strict read not accepted, trying YOLO crops...")
 
     try:
         results = YOLO_MODEL.predict(image_path, conf=0.05, verbose=False)[0]
     except Exception as e:
         print("[BARCODE] YOLO error:", e)
-        return BarcodeStatus.UNSURE, None
+        return (
+            (BarcodeStatus.UNSURE, None) if votes_all else (BarcodeStatus.UNSURE, None)
+        )
 
     boxes = results.boxes
     if boxes is None or len(boxes) == 0:
         print("[BARCODE] YOLO found no regions.")
-        return BarcodeStatus.NONBARCODE, None
+        return (
+            (BarcodeStatus.UNSURE, None)
+            if votes_all
+            else (BarcodeStatus.NONBARCODE, None)
+        )
 
     confs = boxes.conf.cpu().numpy()
     xyxy = boxes.xyxy.cpu().numpy().astype(int)
     order = confs.argsort()[::-1]
 
     h, w = img.shape[:2]
+    tried = 0
+
     for idx in order:
+        if tried >= MAX_YOLO_BOXES:
+            break
+
         x1, y1, x2, y2 = xyxy[idx]
         bw = max(1, x2 - x1)
         bh = max(1, y2 - y1)
@@ -235,46 +336,29 @@ def readBarcode_hf_status(
             continue
 
         crop_big = cv2.resize(crop, None, fx=3.5, fy=3.5, interpolation=cv2.INTER_CUBIC)
+
+        tried += 1
+        votes_c, sources_c = _vote_from_image(crop_big, label=f"crop{tried}")
+
+        for c, n in votes_c.items():
+            _add_vote(votes_all, sources_all, c, src="seed", n=0)
+            votes_all[c] = votes_all.get(c, 0) + n
+            sources_all[c] |= sources_c.get(c, set())
+
+        winner, reason = _pick_winner(votes_all, sources_all)
+        if winner:
+            print(
+                f"[BARCODE] ACCEPT after YOLO crops: {winner} ({votes_all[winner]} votes) reason={reason}"
+            )
+            return BarcodeStatus.BARCODE, winner
+
+    if votes_all:
         print(
-            f"[BARCODE] Trying YOLO crop {idx} conf={confs[idx]:.3f}, size={crop_big.shape[1]}x{crop_big.shape[0]}"
+            f"[BARCODE] NOT ACCEPTED. votes={votes_all}, sources={ {k: sorted(list(v)) for k,v in sources_all.items()} }"
         )
+        return BarcodeStatus.UNSURE, None
 
-        ch, cw = crop_big.shape[:2]
-        center = (cw // 2, ch // 2)
-
-        for angle in [0, 90, -90, 45, -45]:
-            if angle == 0:
-                rotated = crop_big
-            else:
-                M = cv2.getRotationMatrix2D(center, angle, 1.0)
-                rotated = cv2.warpAffine(crop_big, M, (cw, ch))
-
-            code_pyr = decode_with_pyrxing_from_array(rotated)
-            code_zx = decode_with_zxing(rotated)
-
-            if code_pyr and code_zx and code_pyr == code_zx:
-                print(
-                    f"[BARCODE] STRICT YOLO match (box {idx}, angle {angle}°): {code_pyr}"
-                )
-                return BarcodeStatus.BARCODE, code_pyr
-            if code_zx and is_valid_upc_ean(code_zx):
-                print(
-                    f"[BARCODE] YOLO accept ZXing (box {idx}, angle {angle}°): {code_zx}"
-                )
-                return BarcodeStatus.BARCODE, code_zx
-            if code_pyr and is_valid_upc_ean(code_pyr):
-                print(
-                    f"[BARCODE] YOLO accept pyrxing (box {idx}, angle {angle}°): {code_pyr}"
-                )
-                return BarcodeStatus.BARCODE, code_pyr
-
-            if code_pyr or code_zx:
-                print(
-                    f"[BARCODE] YOLO box {idx} angle {angle}° mismatch: pyr={code_pyr}, zxing={code_zx}"
-                )
-
-    print("[BARCODE] Barcode-like regions found but no valid decode.")
-    return BarcodeStatus.UNSURE, None
+    return BarcodeStatus.NONBARCODE, None
 
 
 def readBarcode_hf(image_path: Union[str, Path]) -> Optional[str]:
