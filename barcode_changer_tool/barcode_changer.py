@@ -6,7 +6,7 @@ from typing import List, Optional, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from bisect import bisect_left
 
-from barcode_reader import readBarcode_hf_status, BarcodeStatus
+from barcode_changer_tool.barcode_reader import readBarcode_hf_status, BarcodeStatus
 
 for var in (
     "OMP_NUM_THREADS",
