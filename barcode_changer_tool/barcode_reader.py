@@ -1,16 +1,10 @@
-import os
-import re
-import tempfile
+import os, re, tempfile, cv2, numpy as np, zxingcpp
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Union, Dict, Set, Tuple
-
-import cv2
-import numpy as np
 from huggingface_hub import hf_hub_download
 from ultralytics import YOLO
 from pyrxing import read_barcode
-import zxingcpp
 
 
 weights = hf_hub_download(
@@ -26,14 +20,13 @@ class BarcodeStatus(str, Enum):
     UNSURE = "UNSURE"
 
 
-MIN_VOTES_TO_ACCEPT = 3
-
+MIN_VOTES_TO_ACCEPT = 4
 REQUIRE_BOTH_DECODERS = True
 MIN_MARGIN_OVER_RUNNER_UP = 2
-
 MAX_YOLO_BOXES = 6
-
 ANGLES = [0, 90, -90, 45, -45]
+REQUIRE_YOLO_PRESENCE = True
+YOLO_PRESENCE_CONF = 0.15
 
 
 def extract_upc_candidate(text: str) -> Optional[str]:
@@ -259,6 +252,17 @@ def _vote_from_image(
     return votes, sources
 
 
+def yolo_barcode_present(
+    image_path: Union[str, Path], conf: float = YOLO_PRESENCE_CONF
+) -> bool:
+    try:
+        res = YOLO_MODEL.predict(str(image_path), conf=conf, verbose=False)[0]
+        boxes = res.boxes
+        return boxes is not None and len(boxes) > 0
+    except Exception:
+        return False
+
+
 def readBarcode_hf_status(
     image_path: Union[str, Path],
 ) -> tuple[BarcodeStatus, Optional[str]]:
@@ -267,6 +271,11 @@ def readBarcode_hf_status(
     if img is None:
         print(f"[BARCODE] Cannot read {image_path}")
         return BarcodeStatus.NONBARCODE, None
+
+    if REQUIRE_YOLO_PRESENCE:
+        present = yolo_barcode_present(image_path, conf=YOLO_PRESENCE_CONF)
+        if not present:
+            return BarcodeStatus.NONBARCODE, None
 
     votes_all: Dict[str, int] = {}
     sources_all: Dict[str, Set[str]] = {}
@@ -295,18 +304,12 @@ def readBarcode_hf_status(
         results = YOLO_MODEL.predict(image_path, conf=0.05, verbose=False)[0]
     except Exception as e:
         print("[BARCODE] YOLO error:", e)
-        return (
-            (BarcodeStatus.UNSURE, None) if votes_all else (BarcodeStatus.UNSURE, None)
-        )
+        return BarcodeStatus.UNSURE, None
 
     boxes = results.boxes
     if boxes is None or len(boxes) == 0:
         print("[BARCODE] YOLO found no regions.")
-        return (
-            (BarcodeStatus.UNSURE, None)
-            if votes_all
-            else (BarcodeStatus.NONBARCODE, None)
-        )
+        return BarcodeStatus.UNSURE, None
 
     confs = boxes.conf.cpu().numpy()
     xyxy = boxes.xyxy.cpu().numpy().astype(int)
