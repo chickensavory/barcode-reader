@@ -48,7 +48,7 @@ RAW_EXTS = {
 
 RESET_GAP_SEC = 120.0
 BARCODE_SCAN_RATINGS = {1, 3}
-EXPECTED_RATINGS = (1, 2)
+EXPECTED_RATINGS = (1, 2, 3)
 
 MAX_WORKERS = min(8, (os.cpu_count() or 4))
 
