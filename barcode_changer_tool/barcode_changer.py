@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Dict, Tuple, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from barcode_changer_tool.barcode_reader import readBarcode_hf_status, BarcodeStatus
 from barcode_changer_tool.barcode_rename import read_xmp_rating_and_label, role_from_xmp
 
@@ -43,14 +44,10 @@ RAW_EXTS = {".nef", ".arw", ".cr2", ".cr3"}
 
 RESET_GAP_SEC = 120.0
 
-# Ratings that are allowed to participate in a product set.
-ALLOWED_RATINGS: Set[int] = {1, 2, 3, 4}
-
-# Barcode should only be read from ratings 4 and 1 (prefer 4 if present).
+PRODUCT_GAP_SEC = 10.0
 BARCODE_SCAN_RATINGS = (4, 1)
 
-# A set starts when we see rating 1
-START_RATING = 1
+ALLOWED_RATINGS: Set[int] = {1, 2, 3, 4}
 
 MAX_WORKERS = min(8, (os.cpu_count() or 4))
 
@@ -223,51 +220,40 @@ def _safe_rename(src: Path, dest: Path) -> Path:
 
 
 def build_product_sets(block: List[Photo]) -> List[ProductSet]:
-    """
-    Less strict:
-    - A set starts at rating 1.
-    - Then we collect rating 2/3/4 if present.
-    - If another rating 1 appears, we flush the current set (even if incomplete).
-    - Ratings outside ALLOWED_RATINGS are moved to bad.
-    - Duplicate rating inside a set => moved to bad.
-    """
     sets: List[ProductSet] = []
     cur: Dict[int, Photo] = {}
+    last_ts: Optional[datetime] = None
 
     def flush(reason: str):
-        nonlocal cur
+        nonlocal cur, last_ts
         if not cur:
+            last_ts = None
             return
         sets.append(ProductSet(photos_by_rating=cur))
         cur = {}
+        last_ts = None
 
     for ph in block:
         r = ph.rating
-
         if r not in ALLOWED_RATINGS:
             moveToBad(ph.path, reason=f"unexpected_or_missing_rating={r}")
             continue
 
-        if r == START_RATING:
-            if cur:
-                flush("start_new_set_on_rating_1")
-            cur = {START_RATING: ph}
-            continue
-
-        # ratings 2/3/4 must belong to an active set that started with rating 1
-        if not cur:
-            moveToBad(ph.path, reason=f"rating_{r}_without_leading_rating_1")
-            continue
+        if last_ts is None:
+            cur = {}
+        else:
+            gap = (ph.timestamp - last_ts).total_seconds()
+            if gap > PRODUCT_GAP_SEC:
+                flush("time_gap_new_product")
 
         if r in cur:
-            moveToBad(ph.path, reason=f"duplicate_rating_in_set={r}")
+            moveToBad(ph.path, reason=f"duplicate_rating_in_time_group={r}")
             continue
 
         cur[r] = ph
+        last_ts = ph.timestamp
 
-    if cur:
-        flush("end_of_block_flush")
-
+    flush("end_of_block")
     return sets
 
 
@@ -316,12 +302,11 @@ def decode_barcodes_for_sets(product_sets: List[ProductSet]) -> None:
 def rename_product_set(ps: ProductSet):
     if not ps.barcode:
         for ph in ps.photos_by_rating.values():
-            moveToBad(ph.path, reason="barcode_not_decoded_from_rating_1_or_4")
+            moveToBad(ph.path, reason="barcode_not_decoded_from_rating_4_or_1")
         return
 
     barcode = sanitizeBarcodeForFileName(ps.barcode)
 
-    # Rename whatever exists in the set (1/2/3/4), sorted for predictable output
     for rating in sorted(ps.photos_by_rating.keys()):
         ph = ps.photos_by_rating[rating]
         role, r2, label, reason = role_from_xmp(ph.path)
@@ -347,22 +332,20 @@ def main():
     blocks = chunk_by_reset_gap(photos)
     print(f"[INFO] Found {len(photos)} file(s) across {len(blocks)} time block(s).")
     print(
-        "[INFO] Building product sets starting at rating 1; allowing optional 2/3/4..."
+        f"[INFO] Grouping into products by time gap <= {PRODUCT_GAP_SEC:.1f}s (within blocks)..."
     )
+    print(f"[INFO] Barcode scans only from ratings {list(BARCODE_SCAN_RATINGS)}...")
 
     all_sets: List[ProductSet] = []
     for bi, block in enumerate(blocks, start=1):
         sets = build_product_sets(block)
-        print(f"[INFO] Block {bi}: {len(sets)} product set(s).")
+        print(f"[INFO] Block {bi}: {len(sets)} product group(s).")
         all_sets.extend(sets)
 
     if not all_sets:
-        print("[INFO] No product sets found.")
+        print("[INFO] No product groups found.")
         return
 
-    print(
-        f"[INFO] Decoding barcodes only from star ratings {list(BARCODE_SCAN_RATINGS)}..."
-    )
     decode_barcodes_for_sets(all_sets)
 
     good = 0
@@ -374,7 +357,7 @@ def main():
             bad += 1
         rename_product_set(ps)
 
-    print(f"[INFO] Completed. Sets with decoded barcode: {good}, without: {bad}")
+    print(f"[INFO] Completed. Groups with decoded barcode: {good}, without: {bad}")
     print(f"[TOTAL] Finished in {time.time() - t0:.2f}s")
 
 
