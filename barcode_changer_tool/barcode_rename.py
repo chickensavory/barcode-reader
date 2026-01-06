@@ -7,8 +7,9 @@ from typing import Dict, Optional, Union
 
 DEFAULT_RATING_TO_ROLE: Dict[int, str] = {
     1: "hero",
-    2: "nutritional",
-    3: "packaging",
+    2: "packaging",
+    3: "nutritional",
+    4: "upc",
 }
 
 
