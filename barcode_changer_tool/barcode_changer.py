@@ -5,6 +5,10 @@ from pathlib import Path
 from typing import List, Optional, Dict, Tuple, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# TODO LESS STRICT WITH RATINGS 4, 3, 1 TO READ
+# TODO FRESH INSTALLATION ISSUE
+# TODO PRIO IS HERO SHOT A MUST
+
 from barcode_changer_tool.barcode_reader import readBarcode_hf_status, BarcodeStatus
 from barcode_changer_tool.barcode_rename import read_xmp_rating_and_label, role_from_xmp
 

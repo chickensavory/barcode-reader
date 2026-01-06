@@ -44,7 +44,7 @@ Press:
 
 ```bash
 python3 -m pip install --user --upgrade pip
-python3 -m pip install --user "git+https://github.com/chickensavory/barcode-reader.git"
+python3 -m pip install --no-binary pyrxing "git+https://github.com/chickensavory/barcode-reader.git"
 ````
 
 ### 3) Verify it installed (run the command)
