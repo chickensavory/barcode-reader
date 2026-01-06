@@ -1,14 +1,12 @@
-import os, re, subprocess, time
+import re, os, subprocess, time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Dict, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
 from barcode_changer_tool.barcode_reader import readBarcode_hf_status, BarcodeStatus
 from barcode_changer_tool.barcode_rename import read_xmp_rating_and_label, role_from_xmp
 
-# Keep CPU usage sane for OpenCV / BLAS stacks
 for var in (
     "OMP_NUM_THREADS",
     "OPENBLAS_NUM_THREADS",
@@ -48,8 +46,9 @@ RAW_EXTS = {
     ".cr3",
 }
 
-# Time gap that starts a new set
 RESET_GAP_SEC = 120.0
+BARCODE_SCAN_RATINGS = {1, 3}
+EXPECTED_RATINGS = (1, 2)
 
 MAX_WORKERS = min(8, (os.cpu_count() or 4))
 
@@ -65,7 +64,7 @@ class Photo:
 
 @dataclass
 class ProductSet:
-    photos: List[Photo]
+    photos_by_rating: Dict[int, Photo]
     barcode: Optional[str] = None
 
 
@@ -113,7 +112,6 @@ def listInputFiles() -> List[Path]:
 
 
 def convertRawToTempPNG(raw_path: Path) -> Optional[Path]:
-    """Convert RAW to a temporary PNG for barcode scanning (macOS sips)."""
     if raw_path.suffix.lower() not in RAW_EXTS:
         return None
 
@@ -142,7 +140,6 @@ def convertRawToTempPNG(raw_path: Path) -> Optional[Path]:
 
 
 def _prepare_scan_path(path: Path) -> Tuple[Path, Optional[Path]]:
-    """Returns (scan_path, tmp_file_to_cleanup)."""
     if path.suffix.lower() not in RAW_EXTS:
         return path, None
 
@@ -175,13 +172,11 @@ def loadPhotos() -> List[Photo]:
             Photo(path=p, timestamp=ts, index=idx, rating=rating, label=label)
         )
 
-    # Stable ordering within time blocks
     photos.sort(key=lambda ph: (ph.timestamp, ph.index))
     return photos
 
 
 def chunk_by_reset_gap(photos: List[Photo]) -> List[List[Photo]]:
-    """Split by time gaps only. No star/rating logic here."""
     if not photos:
         return []
     chunks: List[List[Photo]] = []
@@ -226,10 +221,39 @@ def _safe_rename(src: Path, dest: Path) -> Path:
 
 
 def build_product_sets(block: List[Photo]) -> List[ProductSet]:
-    """Loose mode: a time block = one product set, any number of photos."""
-    if not block:
-        return []
-    return [ProductSet(photos=list(block))]
+    sets: List[ProductSet] = []
+    cur: Dict[int, Photo] = {}
+
+    def flush_incomplete(reason: str):
+        nonlocal cur
+        if not cur:
+            return
+        for ph in cur.values():
+            moveToBad(ph.path, reason=reason)
+        cur = {}
+
+    for ph in block:
+        r = ph.rating
+
+        if r not in EXPECTED_RATINGS:
+            moveToBad(ph.path, reason=f"unexpected_or_missing_rating={r}")
+            continue
+
+        if r == 1 and cur:
+            flush_incomplete("incomplete_triplet_before_new_rating_1")
+
+        if r in cur:
+            moveToBad(ph.path, reason=f"duplicate_rating_in_triplet={r}")
+            continue
+
+        cur[r] = ph
+
+        if all(k in cur for k in EXPECTED_RATINGS):
+            sets.append(ProductSet(photos_by_rating=cur))
+            cur = {}
+
+    flush_incomplete("trailing_incomplete_triplet")
+    return sets
 
 
 def _try_decode_barcode(path: Path) -> Optional[str]:
@@ -246,45 +270,52 @@ def _try_decode_barcode(path: Path) -> Optional[str]:
 
 
 def decode_barcodes_for_sets(product_sets: List[ProductSet]) -> None:
-    """
-    Loose mode: try to decode from ANY photo in the set.
-    For speed, decode sets in parallel, but within a set we scan in order.
-    """
+    work: List[Tuple[int, int, Path]] = []
+    for i, ps in enumerate(product_sets):
+        for r in BARCODE_SCAN_RATINGS:
+            ph = ps.photos_by_rating.get(r)
+            if ph is not None:
+                work.append((i, r, ph.path))
 
-    def _decode_one_set(si: int, ps: ProductSet) -> Tuple[int, Optional[str]]:
-        for ph in ps.photos:
-            code = _try_decode_barcode(ph.path)
-            if code:
-                print(f"[BARCODE] set#{si+1}: decoded from {ph.path.name} => {code}")
-                return si, code
-        return si, None
+    if not work:
+        return
+
+    found: Dict[int, str] = {}
+
+    def _worker(item: Tuple[int, int, Path]) -> Tuple[int, int, Optional[str]]:
+        si, r, p = item
+        return si, r, _try_decode_barcode(p)
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = [
-            ex.submit(_decode_one_set, i, ps) for i, ps in enumerate(product_sets)
-        ]
+        futures = [ex.submit(_worker, item) for item in work]
         for fut in as_completed(futures):
-            si, code = fut.result()
-            product_sets[si].barcode = code
+            si, r, code = fut.result()
+            if code and si not in found:
+                found[si] = code
+                print(f"[BARCODE] set#{si+1}: decoded from rating {r} => {code}")
+
+    for i, ps in enumerate(product_sets):
+        ps.barcode = found.get(i)
 
 
 def rename_product_set(ps: ProductSet):
-    """
-    If barcode exists: rename all photos to good/<barcode>_<role>.<ext>
-    Role is read from XMP when possible; if missing, fall back to image_<n>.
-    """
     if not ps.barcode:
-        for ph in ps.photos:
-            moveToBad(ph.path, reason="barcode_not_decoded")
+        for ph in ps.photos_by_rating.values():
+            moveToBad(ph.path, reason="barcode_not_decoded_from_rating_1_or_3")
         return
 
     barcode = sanitizeBarcodeForFileName(ps.barcode)
 
-    for idx, ph in enumerate(ps.photos, start=1):
+    for rating in EXPECTED_RATINGS:
+        ph = ps.photos_by_rating[rating]
         role, r2, label, reason = role_from_xmp(ph.path)
 
         if not role:
-            role = f"image_{idx}"
+            moveToBad(
+                ph.path,
+                reason=f"no_role_from_xmp ({reason}, rating={r2}, label={label})",
+            )
+            continue
 
         dest = GOOD_DIR / f"{barcode}_{role}{ph.path.suffix.lower()}"
         _safe_rename(ph.path, dest)
@@ -300,19 +331,22 @@ def main():
     blocks = chunk_by_reset_gap(photos)
     print(f"[INFO] Found {len(photos)} file(s) across {len(blocks)} time block(s).")
     print(
-        "[INFO] Loose mode: no strict star/rating requirements; scanning any photo for barcode..."
+        f"[INFO] Building product triplets by star ratings {list(EXPECTED_RATINGS)}..."
     )
 
     all_sets: List[ProductSet] = []
     for bi, block in enumerate(blocks, start=1):
         sets = build_product_sets(block)
-        print(f"[INFO] Block {bi}: {len(sets)} set(s), {len(block)} photo(s).")
+        print(f"[INFO] Block {bi}: {len(sets)} complete product set(s).")
         all_sets.extend(sets)
 
     if not all_sets:
-        print("[INFO] No sets found.")
+        print("[INFO] No complete (1,2,3) product sets found.")
         return
 
+    print(
+        f"[INFO] Decoding barcodes only from star ratings {sorted(BARCODE_SCAN_RATINGS)}..."
+    )
     decode_barcodes_for_sets(all_sets)
 
     good = 0
