@@ -47,8 +47,9 @@ RAW_EXTS = {
 }
 
 RESET_GAP_SEC = 120.0
-BARCODE_SCAN_RATINGS = {1, 3}
-EXPECTED_RATINGS = (1, 2, 3)
+BARCODE_PRIMARY_RATING = 4
+BARCODE_FALLBACK_RATINGS = {1, 3}
+EXPECTED_RATINGS = (1, 2, 3, 4)
 
 MAX_WORKERS = min(8, (os.cpu_count() or 4))
 
@@ -270,29 +271,41 @@ def _try_decode_barcode(path: Path) -> Optional[str]:
 
 
 def decode_barcodes_for_sets(product_sets: List[ProductSet]) -> None:
-    work: List[Tuple[int, int, Path]] = []
-    for i, ps in enumerate(product_sets):
-        for r in BARCODE_SCAN_RATINGS:
-            ph = ps.photos_by_rating.get(r)
-            if ph is not None:
-                work.append((i, r, ph.path))
+    def _run(items: List[Tuple[int, int, Path]], found: Dict[int, str]) -> None:
+        if not items:
+            return
 
-    if not work:
-        return
+        def _worker(item: Tuple[int, int, Path]) -> Tuple[int, int, Optional[str]]:
+            si, r, p = item
+            return si, r, _try_decode_barcode(p)
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futures = [ex.submit(_worker, item) for item in items]
+            for fut in as_completed(futures):
+                si, r, code = fut.result()
+                if code and si not in found:
+                    found[si] = code
+                    print(f"[BARCODE] set#{si+1}: decoded from rating {r} => {code}")
+
+    work_primary: List[Tuple[int, int, Path]] = []
+    for i, ps in enumerate(product_sets):
+        ph = ps.photos_by_rating.get(BARCODE_PRIMARY_RATING)
+        if ph is not None:
+            work_primary.append((i, BARCODE_PRIMARY_RATING, ph.path))
 
     found: Dict[int, str] = {}
+    _run(work_primary, found)
 
-    def _worker(item: Tuple[int, int, Path]) -> Tuple[int, int, Optional[str]]:
-        si, r, p = item
-        return si, r, _try_decode_barcode(p)
+    work_fallback: List[Tuple[int, int, Path]] = []
+    for i, ps in enumerate(product_sets):
+        if i in found:
+            continue
+        for r in sorted(BARCODE_FALLBACK_RATINGS):
+            ph = ps.photos_by_rating.get(r)
+            if ph is not None:
+                work_fallback.append((i, r, ph.path))
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = [ex.submit(_worker, item) for item in work]
-        for fut in as_completed(futures):
-            si, r, code = fut.result()
-            if code and si not in found:
-                found[si] = code
-                print(f"[BARCODE] set#{si+1}: decoded from rating {r} => {code}")
+    _run(work_fallback, found)
 
     for i, ps in enumerate(product_sets):
         ps.barcode = found.get(i)
@@ -301,7 +314,9 @@ def decode_barcodes_for_sets(product_sets: List[ProductSet]) -> None:
 def rename_product_set(ps: ProductSet):
     if not ps.barcode:
         for ph in ps.photos_by_rating.values():
-            moveToBad(ph.path, reason="barcode_not_decoded_from_rating_1_or_3")
+            moveToBad(
+                ph.path, reason="barcode_not_decoded_from_rating_4_or_fallback_1_or_3"
+            )
         return
 
     barcode = sanitizeBarcodeForFileName(ps.barcode)
@@ -341,11 +356,11 @@ def main():
         all_sets.extend(sets)
 
     if not all_sets:
-        print("[INFO] No complete (1,2,3) product sets found.")
+        print("[INFO] No complete (1,2,3,4) product sets found.")
         return
 
     print(
-        f"[INFO] Decoding barcodes only from star ratings {sorted(BARCODE_SCAN_RATINGS)}..."
+        f"[INFO] Decoding barcodes: first from star rating 4, then (if needed) from ratings 1 and 3..."
     )
     decode_barcodes_for_sets(all_sets)
 
