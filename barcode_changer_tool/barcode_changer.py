@@ -5,10 +5,6 @@ from pathlib import Path
 from typing import List, Optional, Dict, Tuple, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# TODO LESS STRICT WITH RATINGS 4, 3, 1 TO READ
-# TODO FRESH INSTALLATION ISSUE
-# TODO PRIO IS HERO SHOT A MUST
-
 from barcode_changer_tool.barcode_reader import readBarcode_hf_status, BarcodeStatus
 from barcode_changer_tool.barcode_rename import read_xmp_rating_and_label, role_from_xmp
 
@@ -48,10 +44,11 @@ RAW_EXTS = {".nef", ".arw", ".cr2", ".cr3"}
 
 RESET_GAP_SEC = 120.0
 
-PRODUCT_GAP_SEC = 10.0
-BARCODE_SCAN_RATINGS = (4, 1)
+REQUIRED_RATINGS = {1}
+OPTIONAL_RATINGS = {2, 3, 4}
+ALLOWED_RATINGS = REQUIRED_RATINGS | OPTIONAL_RATINGS
 
-ALLOWED_RATINGS: Set[int] = {1, 2, 3, 4}
+BARCODE_SCAN_PRIORITY = [4, 1, 3, 2]
 
 MAX_WORKERS = min(8, (os.cpu_count() or 4))
 
@@ -209,6 +206,11 @@ def moveToBad(path: Path, reason: str = ""):
     path.rename(dest)
 
 
+def move_set_to_bad(ps: ProductSet, reason: str):
+    for ph in ps.photos_by_rating.values():
+        moveToBad(ph.path, reason=reason)
+
+
 def _safe_rename(src: Path, dest: Path) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
 
@@ -226,38 +228,35 @@ def _safe_rename(src: Path, dest: Path) -> Path:
 def build_product_sets(block: List[Photo]) -> List[ProductSet]:
     sets: List[ProductSet] = []
     cur: Dict[int, Photo] = {}
-    last_ts: Optional[datetime] = None
 
-    def flush(reason: str):
-        nonlocal cur, last_ts
+    def flush(reason_if_bad: str):
+        nonlocal cur
         if not cur:
-            last_ts = None
             return
-        sets.append(ProductSet(photos_by_rating=cur))
+        if 1 in cur:
+            sets.append(ProductSet(photos_by_rating=cur))
+        else:
+            for ph in cur.values():
+                moveToBad(ph.path, reason=reason_if_bad)
         cur = {}
-        last_ts = None
 
     for ph in block:
         r = ph.rating
+
         if r not in ALLOWED_RATINGS:
             moveToBad(ph.path, reason=f"unexpected_or_missing_rating={r}")
             continue
 
-        if last_ts is None:
-            cur = {}
-        else:
-            gap = (ph.timestamp - last_ts).total_seconds()
-            if gap > PRODUCT_GAP_SEC:
-                flush("time_gap_new_product")
+        if r == 1:
+            flush("missing_required_rating_1_before_new_set")
 
         if r in cur:
-            moveToBad(ph.path, reason=f"duplicate_rating_in_time_group={r}")
+            moveToBad(ph.path, reason=f"duplicate_rating_in_set={r}")
             continue
 
         cur[r] = ph
-        last_ts = ph.timestamp
 
-    flush("end_of_block")
+    flush("trailing_set_missing_required_rating_1")
     return sets
 
 
@@ -277,19 +276,21 @@ def _try_decode_barcode(path: Path) -> Optional[str]:
 def decode_barcodes_for_sets(product_sets: List[ProductSet]) -> None:
     work: List[Tuple[int, int, Path]] = []
     for i, ps in enumerate(product_sets):
-        for r in BARCODE_SCAN_RATINGS:
+        for r in BARCODE_SCAN_PRIORITY:
             ph = ps.photos_by_rating.get(r)
             if ph is not None:
                 work.append((i, r, ph.path))
-
-    if not work:
-        return
 
     found: Dict[int, str] = {}
 
     def _worker(item: Tuple[int, int, Path]) -> Tuple[int, int, Optional[str]]:
         si, r, p = item
+        if si in found:
+            return si, r, None
         return si, r, _try_decode_barcode(p)
+
+    if not work:
+        return
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futures = [ex.submit(_worker, item) for item in work]
@@ -304,17 +305,18 @@ def decode_barcodes_for_sets(product_sets: List[ProductSet]) -> None:
 
 
 def rename_product_set(ps: ProductSet):
+    if 1 not in ps.photos_by_rating:
+        move_set_to_bad(ps, reason="missing_required_rating_1")
+        return
+
     if not ps.barcode:
-        for ph in ps.photos_by_rating.values():
-            moveToBad(ph.path, reason="barcode_not_decoded_from_rating_4_or_1")
+        move_set_to_bad(ps, reason="barcode_not_decoded_bruteforce")
         return
 
     barcode = sanitizeBarcodeForFileName(ps.barcode)
 
-    for rating in sorted(ps.photos_by_rating.keys()):
-        ph = ps.photos_by_rating[rating]
+    for rating, ph in sorted(ps.photos_by_rating.items()):
         role, r2, label, reason = role_from_xmp(ph.path)
-
         if not role:
             moveToBad(
                 ph.path,
@@ -335,21 +337,23 @@ def main():
 
     blocks = chunk_by_reset_gap(photos)
     print(f"[INFO] Found {len(photos)} file(s) across {len(blocks)} time block(s).")
-    print(
-        f"[INFO] Grouping into products by time gap <= {PRODUCT_GAP_SEC:.1f}s (within blocks)..."
-    )
-    print(f"[INFO] Barcode scans only from ratings {list(BARCODE_SCAN_RATINGS)}...")
+    print("[INFO] Building product sets: rating 1 required; ratings 2/3/4 optional...")
 
     all_sets: List[ProductSet] = []
     for bi, block in enumerate(blocks, start=1):
         sets = build_product_sets(block)
-        print(f"[INFO] Block {bi}: {len(sets)} product group(s).")
+        print(f"[INFO] Block {bi}: {len(sets)} valid product set(s).")
         all_sets.extend(sets)
 
     if not all_sets:
-        print("[INFO] No product groups found.")
+        print(
+            "[INFO] No valid sets found (requires at least one 1-star image per set)."
+        )
         return
 
+    print(
+        "[INFO] Decoding barcodes (brute force): try rating 4, then 1, then 3, then 2..."
+    )
     decode_barcodes_for_sets(all_sets)
 
     good = 0
@@ -361,7 +365,7 @@ def main():
             bad += 1
         rename_product_set(ps)
 
-    print(f"[INFO] Completed. Groups with decoded barcode: {good}, without: {bad}")
+    print(f"[INFO] Completed. Sets with decoded barcode: {good}, without: {bad}")
     print(f"[TOTAL] Finished in {time.time() - t0:.2f}s")
 
 

@@ -1,10 +1,16 @@
-import os, re, tempfile, cv2, numpy as np, zxingcpp
+import os
+import re
+import tempfile
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Union, Dict, Set, Tuple
+
+import cv2
+import numpy as np
 from huggingface_hub import hf_hub_download
 from ultralytics import YOLO
 from pyrxing import read_barcode
+import zxingcpp
 
 
 weights = hf_hub_download(
@@ -20,11 +26,12 @@ class BarcodeStatus(str, Enum):
     UNSURE = "UNSURE"
 
 
-MIN_VOTES_TO_ACCEPT = 4
+MIN_VOTES_TO_ACCEPT = 3
 REQUIRE_BOTH_DECODERS = True
 MIN_MARGIN_OVER_RUNNER_UP = 2
 MAX_YOLO_BOXES = 6
 ANGLES = [0, 90, -90, 45, -45]
+
 REQUIRE_YOLO_PRESENCE = True
 YOLO_PRESENCE_CONF = 0.15
 
