@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Union
 
+
 DEFAULT_RATING_TO_ROLE: Dict[int, str] = {
     1: "hero",
     2: "packaging",

@@ -3,7 +3,7 @@ import re
 import tempfile
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Union, Dict, Set, Tuple
+from typing import Optional, Union, Dict, Set, Tuple, Iterable
 
 import cv2
 import numpy as np
@@ -26,20 +26,35 @@ class BarcodeStatus(str, Enum):
     UNSURE = "UNSURE"
 
 
-MIN_VOTES_TO_ACCEPT = 3
-REQUIRE_BOTH_DECODERS = True
-MIN_MARGIN_OVER_RUNNER_UP = 2
+YOLO_PRESENCE_CONF = 0.15
+
+MIN_MARGIN_OVER_RUNNER_UP = 0
+MIN_EVIDENCE_TO_ACCEPT = 2
+MIN_VOTES_STRICT = 3
+MIN_VOTES_LENIENT = 2
+
 MAX_YOLO_BOXES = 6
 ANGLES = [0, 90, -90, 45, -45]
 
-REQUIRE_YOLO_PRESENCE = True
-YOLO_PRESENCE_CONF = 0.15
+MIN_CROP_AREA_PX = 2_000
+MIN_ASPECT_RATIO_1D = 1.25
+
+ALLOWED_ZX_FORMATS = {
+    zxingcpp.BarcodeFormat.EAN13,
+    zxingcpp.BarcodeFormat.EAN8,
+    zxingcpp.BarcodeFormat.UPCA,
+    zxingcpp.BarcodeFormat.ITF,
+}
+
+DUAL_DECODER_MATCH_BONUS_VOTES = 3
+
+DEFAULT_MIN_BOX_AREA_RATIO = 0.012
+DEFAULT_MIN_BOX_MAX_DIM_RATIO = 0.18
 
 
 def extract_upc_candidate(text: str) -> Optional[str]:
     if not text:
         return None
-
     raw = text.strip()
     if not raw:
         return None
@@ -133,6 +148,13 @@ def enhance_for_pyrxing(img_bgr: np.ndarray) -> np.ndarray:
     return bw
 
 
+def enhance_for_zxing_mild(img_bgr: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (0, 0), sigmaX=0.8)
+    gray = cv2.convertScaleAbs(gray, alpha=1.15, beta=0)
+    return gray
+
+
 def decode_with_pyrxing_from_array(img_bgr: np.ndarray) -> Optional[str]:
     if img_bgr is None or img_bgr.size == 0:
         return None
@@ -159,16 +181,55 @@ def decode_with_pyrxing_from_array(img_bgr: np.ndarray) -> Optional[str]:
             pass
 
 
-def decode_with_zxing(img_bgr: np.ndarray) -> Optional[str]:
+def _zxing_results_from_gray(gray: np.ndarray) -> Iterable[zxingcpp.Barcode]:
+    try:
+        return zxingcpp.read_barcodes(gray) or []
+    except Exception:
+        return []
+
+
+def _zxing_geometry_plausible(res: zxingcpp.Barcode) -> bool:
+    try:
+        pos = getattr(res, "position", None)
+        if not pos:
+            return True
+
+        xs = [p.x for p in pos]
+        ys = [p.y for p in pos]
+        w = max(xs) - min(xs)
+        h = max(ys) - min(ys)
+        if w <= 0 or h <= 0:
+            return False
+
+        area = w * h
+        ar = (w / h) if w >= h else (h / w)
+
+        if area < 400:
+            return False
+        if ar < 1.05:
+            return False
+        return True
+    except Exception:
+        return True
+
+
+def decode_with_zxing(
+    img_bgr: np.ndarray,
+    allow_secondary_pass_only_if_matches: Optional[Set[str]] = None,
+) -> Optional[str]:
     if img_bgr is None or img_bgr.size == 0:
         return None
 
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    results = zxingcpp.read_barcodes(gray)
-    if not results:
-        return None
+    for res in _zxing_results_from_gray(gray):
+        if not getattr(res, "valid", True):
+            continue
+        fmt = getattr(res, "format", None)
+        if fmt is not None and fmt not in ALLOWED_ZX_FORMATS:
+            continue
+        if not _zxing_geometry_plausible(res):
+            continue
 
-    for res in results:
         raw = (res.text or "").strip()
         if not raw:
             continue
@@ -177,7 +238,33 @@ def decode_with_zxing(img_bgr: np.ndarray) -> Optional[str]:
             print(f"[BARCODE] ZXing decoded: {raw} -> {candidate}")
             return candidate
 
+    if allow_secondary_pass_only_if_matches:
+        gray2 = enhance_for_zxing_mild(img_bgr)
+        for res in _zxing_results_from_gray(gray2):
+            if not getattr(res, "valid", True):
+                continue
+            fmt = getattr(res, "format", None)
+            if fmt is not None and fmt not in ALLOWED_ZX_FORMATS:
+                continue
+            if not _zxing_geometry_plausible(res):
+                continue
+
+            raw = (res.text or "").strip()
+            if not raw:
+                continue
+            candidate = extract_upc_candidate(raw)
+            if (
+                candidate
+                and is_valid_upc_ean(candidate)
+                and candidate in allow_secondary_pass_only_if_matches
+            ):
+                print(f"[BARCODE] ZXing (mild) agrees: {raw} -> {candidate}")
+                return candidate
+
     return None
+
+
+Evidence = Tuple[str, int, str]
 
 
 def _rotate(img_bgr: np.ndarray, angle: int) -> np.ndarray:
@@ -191,20 +278,23 @@ def _rotate(img_bgr: np.ndarray, angle: int) -> np.ndarray:
 
 def _add_vote(
     votes: Dict[str, int],
-    sources: Dict[str, Set[str]],
+    evidence: Dict[str, Set[Evidence]],
     code: str,
-    src: str,
+    decoder: str,
+    angle: int,
+    region_label: str,
     n: int = 1,
 ):
     votes[code] = votes.get(code, 0) + n
-    if code not in sources:
-        sources[code] = set()
-    sources[code].add(src)
+    evidence.setdefault(code, set()).add((decoder, angle, region_label))
 
 
 def _pick_winner(
     votes: Dict[str, int],
-    sources: Dict[str, Set[str]],
+    evidence: Dict[str, Set[Evidence]],
+    min_votes: int,
+    min_margin: int,
+    min_evidence: int,
 ) -> Tuple[Optional[str], str]:
     if not votes:
         return None, "no_votes"
@@ -213,65 +303,141 @@ def _pick_winner(
     winner, wv = ranked[0]
     runner_up = ranked[1][1] if len(ranked) > 1 else 0
 
-    if wv < MIN_VOTES_TO_ACCEPT:
-        return None, f"winner_has_{wv}_votes_lt_{MIN_VOTES_TO_ACCEPT}"
+    if wv < min_votes:
+        return None, f"winner_has_{wv}_votes_lt_{min_votes}"
 
-    if (wv - runner_up) < MIN_MARGIN_OVER_RUNNER_UP:
-        return None, f"too_close_winner_{wv}_runnerup_{runner_up}"
+    if (wv - runner_up) < min_margin:
+        return (
+            None,
+            f"too_close_winner_{wv}_runnerup_{runner_up}_lt_margin_{min_margin}",
+        )
 
-    if REQUIRE_BOTH_DECODERS:
-        srcs = sources.get(winner, set())
-        if not ("zx" in srcs and "pyr" in srcs):
-            return None, f"winner_missing_both_decoders_sources={sorted(list(srcs))}"
+    evc = len(evidence.get(winner, set()))
+    if evc < min_evidence:
+        return None, f"winner_has_{evc}_evidence_lt_{min_evidence}"
 
     return winner, "accepted"
 
 
 def _vote_from_image(
-    img_bgr: np.ndarray, label: str
-) -> Tuple[Dict[str, int], Dict[str, Set[str]]]:
+    img_bgr: np.ndarray,
+    region_label: str,
+) -> Tuple[Dict[str, int], Dict[str, Set[Evidence]]]:
     votes: Dict[str, int] = {}
-    sources: Dict[str, Set[str]] = {}
+    evidence: Dict[str, Set[Evidence]] = {}
 
     if img_bgr is None or img_bgr.size == 0:
-        return votes, sources
+        return votes, evidence
 
     for angle in ANGLES:
         rotated = _rotate(img_bgr, angle)
 
         code_pyr = decode_with_pyrxing_from_array(rotated)
-        code_zx = decode_with_zxing(rotated)
+        already = set([code_pyr]) if code_pyr else set()
+        code_zx = decode_with_zxing(
+            rotated, allow_secondary_pass_only_if_matches=already
+        )
 
         if code_pyr and code_zx and code_pyr == code_zx:
-            print(f"[BARCODE] {label}: match at {angle}° => {code_zx} (2 votes)")
-            _add_vote(votes, sources, code_zx, "zx", n=1)
-            _add_vote(votes, sources, code_pyr, "pyr", n=1)
+            print(
+                f"[BARCODE] {region_label}: dual-decoder match at {angle}° => {code_zx} (+{DUAL_DECODER_MATCH_BONUS_VOTES} votes)"
+            )
+            _add_vote(
+                votes,
+                evidence,
+                code_zx,
+                "zx",
+                angle,
+                region_label,
+                n=DUAL_DECODER_MATCH_BONUS_VOTES,
+            )
+            _add_vote(
+                votes,
+                evidence,
+                code_pyr,
+                "pyr",
+                angle,
+                region_label,
+                n=DUAL_DECODER_MATCH_BONUS_VOTES,
+            )
             continue
 
         if code_zx:
-            print(f"[BARCODE] {label}: zx at {angle}° => {code_zx}")
-            _add_vote(votes, sources, code_zx, "zx", n=1)
+            print(f"[BARCODE] {region_label}: zx at {angle}° => {code_zx}")
+            _add_vote(votes, evidence, code_zx, "zx", angle, region_label, n=1)
 
         if code_pyr:
-            print(f"[BARCODE] {label}: pyr at {angle}° => {code_pyr}")
-            _add_vote(votes, sources, code_pyr, "pyr", n=1)
+            print(f"[BARCODE] {region_label}: pyr at {angle}° => {code_pyr}")
+            _add_vote(votes, evidence, code_pyr, "pyr", angle, region_label, n=1)
 
-    return votes, sources
+    return votes, evidence
 
 
-def yolo_barcode_present(
-    image_path: Union[str, Path], conf: float = YOLO_PRESENCE_CONF
-) -> bool:
-    try:
-        res = YOLO_MODEL.predict(str(image_path), conf=conf, verbose=False)[0]
-        boxes = res.boxes
-        return boxes is not None and len(boxes) > 0
-    except Exception:
+def yolo_detect_boxes(
+    image_path: Union[str, Path],
+    conf: float = 0.05,
+) -> Tuple[np.ndarray, np.ndarray]:
+    res = YOLO_MODEL.predict(str(image_path), conf=conf, verbose=False)[0]
+    boxes = res.boxes
+    if boxes is None or len(boxes) == 0:
+        return np.zeros((0, 4), dtype=int), np.zeros((0,), dtype=float)
+
+    confs = boxes.conf.cpu().numpy()
+    xyxy = boxes.xyxy.cpu().numpy().astype(int)
+    order = confs.argsort()[::-1]
+    return xyxy[order], confs[order]
+
+
+def _crop_plausible(x1: int, y1: int, x2: int, y2: int) -> bool:
+    bw = max(0, x2 - x1)
+    bh = max(0, y2 - y1)
+    if bw <= 0 or bh <= 0:
         return False
+    area = bw * bh
+    if area < MIN_CROP_AREA_PX:
+        return False
+    ar = bw / bh if bh else 999.0
+    ar = ar if ar >= 1.0 else (1.0 / ar)
+    if ar < MIN_ASPECT_RATIO_1D:
+        return False
+    return True
+
+
+def yolo_has_large_enough_barcode_region(
+    image_path: Union[str, Path],
+    min_area_ratio: float = DEFAULT_MIN_BOX_AREA_RATIO,
+    min_max_dim_ratio: float = DEFAULT_MIN_BOX_MAX_DIM_RATIO,
+) -> bool:
+    img = cv2.imread(str(image_path))
+    if img is None:
+        return False
+    h, w = img.shape[:2]
+    img_area = float(h * w)
+    max_dim = float(max(h, w))
+
+    xyxy, confs = yolo_detect_boxes(image_path, conf=0.05)
+    if xyxy.shape[0] == 0:
+        return False
+
+    for (x1, y1, x2, y2), c in zip(xyxy, confs):
+        bw = max(0, x2 - x1)
+        bh = max(0, y2 - y1)
+        if bw <= 0 or bh <= 0:
+            continue
+        area_ratio = (bw * bh) / img_area
+        max_dim_ratio = max(bw, bh) / max_dim
+        if area_ratio >= min_area_ratio and max_dim_ratio >= min_max_dim_ratio:
+            return True
+
+    return False
 
 
 def readBarcode_hf_status(
     image_path: Union[str, Path],
+    *,
+    require_large_region: bool = False,
+    min_box_area_ratio: float = DEFAULT_MIN_BOX_AREA_RATIO,
+    min_box_max_dim_ratio: float = DEFAULT_MIN_BOX_MAX_DIM_RATIO,
 ) -> tuple[BarcodeStatus, Optional[str]]:
     image_path = str(image_path)
     img = cv2.imread(image_path)
@@ -279,67 +445,74 @@ def readBarcode_hf_status(
         print(f"[BARCODE] Cannot read {image_path}")
         return BarcodeStatus.NONBARCODE, None
 
-    if REQUIRE_YOLO_PRESENCE:
-        present = yolo_barcode_present(image_path, conf=YOLO_PRESENCE_CONF)
-        if not present:
+    if require_large_region:
+        ok = yolo_has_large_enough_barcode_region(
+            image_path,
+            min_area_ratio=min_box_area_ratio,
+            min_max_dim_ratio=min_box_max_dim_ratio,
+        )
+        if not ok:
+            print(
+                "[BARCODE] Rejecting decode attempt: barcode region too small (hero-shot defense)."
+            )
             return BarcodeStatus.NONBARCODE, None
 
+    xyxy, _ = yolo_detect_boxes(image_path, conf=YOLO_PRESENCE_CONF)
+    yolo_present = xyxy.shape[0] > 0
+    min_votes = MIN_VOTES_LENIENT if yolo_present else MIN_VOTES_STRICT
+    min_margin = MIN_MARGIN_OVER_RUNNER_UP
+    min_evidence = MIN_EVIDENCE_TO_ACCEPT
+
     votes_all: Dict[str, int] = {}
-    sources_all: Dict[str, Set[str]] = {}
+    evidence_all: Dict[str, Set[Evidence]] = {}
 
-    votes, sources = _vote_from_image(img, label="full")
+    votes, evidence = _vote_from_image(img, region_label="full")
     for c, n in votes.items():
-        _add_vote(votes_all, sources_all, c, src="seed", n=0)
         votes_all[c] = votes_all.get(c, 0) + n
-        sources_all[c] |= sources.get(c, set())
+        evidence_all.setdefault(c, set()).update(evidence.get(c, set()))
 
-    winner, reason = _pick_winner(votes_all, sources_all)
+    winner, reason = _pick_winner(
+        votes_all, evidence_all, min_votes, min_margin, min_evidence
+    )
     if winner:
         print(
-            f"[BARCODE] ACCEPT full-image winner: {winner} ({votes_all[winner]} votes) reason={reason}"
+            f"[BARCODE] ACCEPT full-image winner: {winner} "
+            f"({votes_all[winner]} votes, {len(evidence_all[winner])} evidence) reason={reason}"
         )
         return BarcodeStatus.BARCODE, winner
 
-    if votes_all:
-        print(
-            f"[BARCODE] Full-image votes present but not accepted: reason={reason}, votes={votes_all}"
-        )
-
-    print("[BARCODE] Full-image strict read not accepted, trying YOLO crops...")
+    print("[BARCODE] Full-image not accepted; trying YOLO crops...")
 
     try:
-        results = YOLO_MODEL.predict(image_path, conf=0.05, verbose=False)[0]
+        xyxy, confs = yolo_detect_boxes(image_path, conf=0.05)
     except Exception as e:
         print("[BARCODE] YOLO error:", e)
-        return BarcodeStatus.UNSURE, None
+        return (BarcodeStatus.UNSURE if votes_all else BarcodeStatus.NONBARCODE), None
 
-    boxes = results.boxes
-    if boxes is None or len(boxes) == 0:
+    if xyxy.shape[0] == 0:
         print("[BARCODE] YOLO found no regions.")
-        return BarcodeStatus.UNSURE, None
-
-    confs = boxes.conf.cpu().numpy()
-    xyxy = boxes.xyxy.cpu().numpy().astype(int)
-    order = confs.argsort()[::-1]
+        return (BarcodeStatus.UNSURE if votes_all else BarcodeStatus.NONBARCODE), None
 
     h, w = img.shape[:2]
     tried = 0
 
-    for idx in order:
+    for x1, y1, x2, y2 in xyxy:
         if tried >= MAX_YOLO_BOXES:
             break
 
-        x1, y1, x2, y2 = xyxy[idx]
-        bw = max(1, x2 - x1)
-        bh = max(1, y2 - y1)
+        if not _crop_plausible(int(x1), int(y1), int(x2), int(y2)):
+            continue
+
+        bw = max(1, int(x2) - int(x1))
+        bh = max(1, int(y2) - int(y1))
 
         pad_x = max(30, int(0.6 * bw))
         pad_y = max(10, int(0.2 * bh))
 
-        x1p = max(0, x1 - pad_x)
-        y1p = max(0, y1 - pad_y)
-        x2p = min(w, x2 + pad_x)
-        y2p = min(h, y2 + pad_y)
+        x1p = max(0, int(x1) - pad_x)
+        y1p = max(0, int(y1) - pad_y)
+        x2p = min(w, int(x2) + pad_x)
+        y2p = min(h, int(y2) + pad_y)
 
         crop = img[y1p:y2p, x1p:x2p]
         if crop.size == 0:
@@ -348,29 +521,39 @@ def readBarcode_hf_status(
         crop_big = cv2.resize(crop, None, fx=3.5, fy=3.5, interpolation=cv2.INTER_CUBIC)
 
         tried += 1
-        votes_c, sources_c = _vote_from_image(crop_big, label=f"crop{tried}")
-
+        votes_c, evidence_c = _vote_from_image(crop_big, region_label=f"crop{tried}")
         for c, n in votes_c.items():
-            _add_vote(votes_all, sources_all, c, src="seed", n=0)
             votes_all[c] = votes_all.get(c, 0) + n
-            sources_all[c] |= sources_c.get(c, set())
+            evidence_all.setdefault(c, set()).update(evidence_c.get(c, set()))
 
-        winner, reason = _pick_winner(votes_all, sources_all)
+        winner, reason = _pick_winner(
+            votes_all, evidence_all, min_votes, min_margin, min_evidence
+        )
         if winner:
             print(
-                f"[BARCODE] ACCEPT after YOLO crops: {winner} ({votes_all[winner]} votes) reason={reason}"
+                f"[BARCODE] ACCEPT after YOLO crops: {winner} "
+                f"({votes_all[winner]} votes, {len(evidence_all[winner])} evidence) reason={reason}"
             )
             return BarcodeStatus.BARCODE, winner
 
     if votes_all:
-        print(
-            f"[BARCODE] NOT ACCEPTED. votes={votes_all}, sources={ {k: sorted(list(v)) for k,v in sources_all.items()} }"
-        )
+        print(f"[BARCODE] NOT ACCEPTED. votes={votes_all}")
         return BarcodeStatus.UNSURE, None
 
     return BarcodeStatus.NONBARCODE, None
 
 
-def readBarcode_hf(image_path: Union[str, Path]) -> Optional[str]:
-    status, code = readBarcode_hf_status(image_path)
+def readBarcode_hf(
+    image_path: Union[str, Path],
+    *,
+    require_large_region: bool = False,
+    min_box_area_ratio: float = DEFAULT_MIN_BOX_AREA_RATIO,
+    min_box_max_dim_ratio: float = DEFAULT_MIN_BOX_MAX_DIM_RATIO,
+) -> Optional[str]:
+    status, code = readBarcode_hf_status(
+        image_path,
+        require_large_region=require_large_region,
+        min_box_area_ratio=min_box_area_ratio,
+        min_box_max_dim_ratio=min_box_max_dim_ratio,
+    )
     return code if status == BarcodeStatus.BARCODE else None
