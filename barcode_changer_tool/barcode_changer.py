@@ -36,8 +36,8 @@ except ImportError:
     Image = None
 
 INPUT_DIR = Path("input")
-GOOD_DIR = Path("good_LS2B")
-BAD_DIR = Path("bad_LS2B")
+GOOD_DIR = Path("good")
+BAD_DIR = Path("bad")
 
 SUPPORTED_EXTS = {
     ".jpg",
