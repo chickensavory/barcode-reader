@@ -38,8 +38,8 @@ except ImportError:
 
 
 INPUT_DIR = Path("input")
-GOOD_DIR = Path("good_color2")
-BAD_DIR = Path("bad_color2")
+GOOD_DIR = Path("good")
+BAD_DIR = Path("bad")
 
 SUPPORTED_EXTS = {
     ".jpg",
