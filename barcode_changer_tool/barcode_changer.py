@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from barcode_reader import readBarcode_hf_status, BarcodeStatus
-from barcode_rename import (
+from barcode_changer_tool.barcode_reader import readBarcode_hf_status, BarcodeStatus
+from barcode_changer_tool.barcode_rename import (
     read_xmp_label,
     token_from_color_label,
     role_from_xmp,
