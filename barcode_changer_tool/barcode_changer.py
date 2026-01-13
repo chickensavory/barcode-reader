@@ -13,10 +13,11 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from barcode_changer_tool.barcode_reader import readBarcode_hf_status, BarcodeStatus
-from barcode_changer_tool.barcode_rename import (
+from barcode_reader import readBarcode_hf_status, BarcodeStatus
+from barcode_rename import (
     read_xmp_label,
     token_from_color_label,
+    role_from_xmp,
 )
 
 YOLO_LOCK = threading.Lock()
@@ -37,8 +38,8 @@ except ImportError:
 
 
 INPUT_DIR = Path("input")
-GOOD_DIR = Path("good_color")
-BAD_DIR = Path("bad_color")
+GOOD_DIR = Path("good_color2")
+BAD_DIR = Path("bad_color2")
 
 SUPPORTED_EXTS = {
     ".jpg",
@@ -57,9 +58,7 @@ SUPPORTED_EXTS = {
 RAW_EXTS = {".nef", ".arw", ".cr2", ".cr3"}
 
 RESET_GAP_SEC = 120.0
-
 ANCHOR_RATING = 1
-
 MAX_WORKERS = min(8, (os.cpu_count() or 4))
 
 
@@ -179,8 +178,7 @@ def loadPhotos() -> List[Photo]:
         ts = getPhotoTimestamp(p)
 
         meta = read_xmp_label(p)
-        rating = getattr(meta, "rating", None)
-        label = getattr(meta, "label", None)
+        rating, label = meta.rating, meta.label
 
         photos.append(
             Photo(
@@ -259,15 +257,17 @@ def build_product_sets(block: List[Photo]) -> List[ProductSet]:
         cur_anchor = None
 
     for ph in block:
+        r = ph.rating
+
         if cur_anchor is None:
-            if ph.rating == ANCHOR_RATING:
+            if r == ANCHOR_RATING:
                 cur_anchor = ph
                 cur_photos = [ph]
             else:
                 moveToBad(ph.path, reason="seen_before_any_anchor_rating_1")
             continue
 
-        if ph.rating == ANCHOR_RATING:
+        if r == ANCHOR_RATING:
             flush_current()
             cur_anchor = ph
             cur_photos = [ph]
@@ -333,18 +333,6 @@ def decode_barcodes_for_sets(product_sets: List[ProductSet]) -> None:
             _ = fut.result()
 
 
-def token_for_photo_from_label(ph: Photo, idx_in_set: int) -> str:
-    label = ph.label
-    mapped = token_from_color_label(label)
-    if mapped:
-        return sanitizeStemToken(str(mapped)).lower()
-
-    if label:
-        return sanitizeStemToken(str(label)).lower()
-
-    return f"img{idx_in_set:02d}"
-
-
 def rename_product_set(ps: ProductSet):
     if not ps.barcode:
         move_set_to_bad(ps, reason="barcode_failed_for_entire_set")
@@ -353,7 +341,33 @@ def rename_product_set(ps: ProductSet):
     barcode = sanitizeBarcodeForFileName(ps.barcode)
 
     for idx, ph in enumerate(ps.photos, start=1):
-        token = token_for_photo_from_label(ph, idx_in_set=idx)
+        meta = read_xmp_label(ph.path)
+        rating, label = meta.rating, meta.label
+
+        role, _r2, _l2, reason = role_from_xmp(ph.path)
+        token: Optional[str] = None
+
+        mapped = token_from_color_label(label)
+        if mapped:
+            token = mapped
+
+        if not token and role:
+            token = str(role).strip().lower()
+
+        if not token and label:
+            token = str(label).strip().lower()
+            print(
+                f"[ROLE] No mapped color/role; using label fallback => {token} ({reason})"
+            )
+
+        if not token:
+            token = f"img{idx:02d}"
+            print(
+                f"[ROLE] No xmp role/label; using ordinal fallback => {token} ({reason})"
+            )
+
+        token = sanitizeStemToken(token).lower()
+
         dest = GOOD_DIR / f"{barcode}_{token}{ph.path.suffix.lower()}"
         _safe_rename(ph.path, dest)
 

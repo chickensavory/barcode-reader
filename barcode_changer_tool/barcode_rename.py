@@ -79,9 +79,7 @@ def _iter_jpeg_segments(data: bytes):
         marker = data[j]
         i = j + 1
 
-        if marker == 0xD9:
-            break
-        if marker == 0xDA:
+        if marker in (0xD9, 0xDA):  # EOI or SOS
             break
 
         if i + 2 > n:
@@ -119,70 +117,105 @@ def _extract_xmpmeta_fragment_anywhere(data: bytes) -> Optional[bytes]:
     return data[start:end]
 
 
-def _parse_xmp_label_only(xmp_xml_bytes: bytes) -> Optional[str]:
+@dataclass(frozen=True)
+class XmpMeta:
+    rating: Optional[int]
+    label: Optional[str]
+
+
+def _decode_xml_bytes(xmp_xml_bytes: bytes) -> Optional[str]:
     if not xmp_xml_bytes:
         return None
-
-    txt = None
     for enc in ("utf-8", "utf-8-sig", "latin-1"):
         try:
-            txt = xmp_xml_bytes.decode(enc, errors="replace")
-            break
+            return xmp_xml_bytes.decode(enc, errors="replace")
         except Exception:
             continue
+    return None
+
+
+def _parse_xmp_label_and_rating(xmp_xml_bytes: bytes) -> XmpMeta:
+    txt = _decode_xml_bytes(xmp_xml_bytes)
     if txt is None:
-        return None
+        return XmpMeta(None, None)
 
     try:
         root = ET.fromstring(txt)
     except Exception:
-        return None
+        return XmpMeta(None, None)
 
     label: Optional[str] = None
+    rating: Optional[int] = None
 
     for elem in root.iter():
         for k, v in elem.attrib.items():
-            if _localname(str(k)) == "label":
+            lk = _localname(str(k))
+            if lk == "label" and not label:
                 sv = str(v).strip()
                 if sv:
-                    return sv
+                    label = sv
+            elif lk == "rating" and rating is None:
+                sv = str(v).strip()
+                try:
+                    rating = int(sv)
+                except Exception:
+                    pass
 
     for elem in root.iter():
-        if _localname(elem.tag) == "label":
+        lt = _localname(elem.tag)
+        if lt == "label" and not label:
             t = (elem.text or "").strip()
             if t:
-                return t
+                label = t
+        elif lt == "rating" and rating is None:
+            t = (elem.text or "").strip()
+            try:
+                rating = int(t)
+            except Exception:
+                pass
 
-    return label
+    return XmpMeta(rating=rating, label=label)
 
 
-@dataclass(frozen=True)
-class XmpMeta:
-    label: Optional[str]
+def _xmp_sidecar_path(image_path: Path) -> Path:
+    return image_path.with_suffix(".xmp")
+
+
+def _read_xmp_packet_bytes_from_file(image_path: Path) -> Optional[bytes]:
+    sidecar = _xmp_sidecar_path(image_path)
+    if sidecar.exists() and sidecar.is_file():
+        try:
+            return sidecar.read_bytes()
+        except Exception:
+            pass
+
+    try:
+        data = image_path.read_bytes()
+    except Exception:
+        return None
+
+    if image_path.suffix.lower() in (".jpg", ".jpeg"):
+        xmp_bytes = _extract_xmp_from_jpeg_bytes(data)
+        if xmp_bytes:
+            return xmp_bytes
+
+    frag = _extract_xmpmeta_fragment_anywhere(data)
+    if frag:
+        return frag
+
+    return None
+
+
+def read_xmp_meta(image_path: Union[str, Path]) -> XmpMeta:
+    p = Path(image_path)
+    xmp_bytes = _read_xmp_packet_bytes_from_file(p)
+    if not xmp_bytes:
+        return XmpMeta(None, None)
+    return _parse_xmp_label_and_rating(xmp_bytes)
 
 
 def read_xmp_label(image_path: Union[str, Path]) -> XmpMeta:
-    p = Path(image_path)
-    try:
-        data = p.read_bytes()
-    except Exception:
-        return XmpMeta(None)
-
-    xmp_bytes: Optional[bytes] = None
-
-    if p.suffix.lower() in (".jpg", ".jpeg"):
-        xmp_bytes = _extract_xmp_from_jpeg_bytes(data)
-
-    if not xmp_bytes:
-        frag = _extract_xmpmeta_fragment_anywhere(data)
-        if frag:
-            xmp_bytes = frag
-
-    if not xmp_bytes:
-        return XmpMeta(None)
-
-    label = _parse_xmp_label_only(xmp_bytes)
-    return XmpMeta(label=label)
+    return read_xmp_meta(image_path)
 
 
 def token_from_color_label(
@@ -200,7 +233,7 @@ def token_from_xmp_label(
     image_path: Union[str, Path],
     label_to_token: Optional[Dict[str, str]] = None,
 ) -> tuple[Optional[str], Optional[str], str]:
-    meta = read_xmp_label(image_path)
+    meta = read_xmp_meta(image_path)
     label = meta.label
 
     if not label:
@@ -217,5 +250,16 @@ def role_from_xmp(
     image_path: Union[str, Path],
     rating_to_role=None,
 ) -> tuple[Optional[str], Optional[int], Optional[str], str]:
-    token, label, reason = token_from_xmp_label(image_path)
-    return token, None, label, reason
+    meta = read_xmp_meta(image_path)
+
+    token = token_from_color_label(meta.label)
+    if token:
+        return token, meta.rating, meta.label, "ok"
+
+    if meta.label:
+        return None, meta.rating, meta.label, "unmapped_label"
+
+    if meta.rating is not None:
+        return None, meta.rating, None, "rating_only"
+
+    return None, None, None, "no_xmp_found"
