@@ -1,25 +1,21 @@
 import os
+
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 import threading
+
 YOLO_LOCK = threading.Lock()
 
-import re, subprocess, time
+import re, subprocess, time, struct
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from barcode_changer_tool.barcode_reader import readBarcode_hf_status, BarcodeStatus
-from barcode_changer_tool.barcode_rename import read_xmp_rating_and_label, role_from_xmp
-
-DEFAULT_RATING_TO_ROLE: Dict[int, str] = {
-    1: "hero",
-    2: "packaging",
-    3: "nutritional",
-    4: "upc",
-}
+from barcode_changer_tool.barcode_rename import role_from_xmp
 
 for var in (
     "OMP_NUM_THREADS",
@@ -36,8 +32,8 @@ except ImportError:
     Image = None
 
 INPUT_DIR = Path("input")
-GOOD_DIR = Path("good")
-BAD_DIR = Path("bad")
+GOOD_DIR = Path("good_test")
+BAD_DIR = Path("bad_test")
 
 SUPPORTED_EXTS = {
     ".jpg",
@@ -56,11 +52,154 @@ SUPPORTED_EXTS = {
 RAW_EXTS = {".nef", ".arw", ".cr2", ".cr3"}
 
 RESET_GAP_SEC = 120.0
-ALLOWED_RATINGS = {1, 2, 3, 4}
-
-BARCODE_SCAN_PRIORITY = [4, 1]
-
+ANCHOR_RATING = 1
 MAX_WORKERS = min(8, (os.cpu_count() or 4))
+
+SOI = b"\xff\xd8"
+XMP_ID = b"http://ns.adobe.com/xap/1.0/\x00"
+XMP_NS = "http://ns.adobe.com/xap/1.0/"
+RDF_NS = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+
+
+def _iter_jpeg_segments(data: bytes):
+    if not data.startswith(SOI):
+        return
+
+    i = 2
+    n = len(data)
+
+    while i < n:
+        if data[i] != 0xFF:
+            i += 1
+            continue
+
+        j = i
+        while j < n and data[j] == 0xFF:
+            j += 1
+        if j >= n:
+            break
+
+        marker = data[j]
+        i = j + 1
+
+        if marker == 0xD9:
+            yield (marker, j - 1, i, i)
+            break
+
+        if marker == 0xDA:
+            if i + 2 > n:
+                break
+            seglen = struct.unpack(">H", data[i : i + 2])[0]
+            seg_start = j - 1
+            seg_end = i + seglen
+            payload_start = i + 2
+            yield (marker, seg_start, seg_end, payload_start)
+            break
+
+        if i + 2 > n:
+            break
+
+        seglen = struct.unpack(">H", data[i : i + 2])[0]
+        seg_start = j - 1
+        seg_end = i + seglen
+        payload_start = i + 2
+        yield (marker, seg_start, seg_end, payload_start)
+        i = seg_end
+
+
+def _extract_xmp_packet_from_jpeg(jpeg_path: Path) -> Optional[bytes]:
+    try:
+        data = jpeg_path.read_bytes()
+    except Exception:
+        return None
+
+    if not data.startswith(SOI):
+        return None
+
+    for marker, seg_start, seg_end, payload_start in _iter_jpeg_segments(data):
+        if marker != 0xE1:
+            continue
+        payload = data[payload_start:seg_end]
+        if payload.startswith(XMP_ID):
+            return payload[len(XMP_ID) :]
+    return None
+
+
+def _parse_xmp_rating_and_label_from_xml(
+    xmp_xml_bytes: bytes,
+) -> Tuple[Optional[int], Optional[str]]:
+    if not xmp_xml_bytes:
+        return None, None
+
+    txt = None
+    for enc in ("utf-8", "utf-8-sig", "latin-1"):
+        try:
+            txt = xmp_xml_bytes.decode(enc, errors="replace")
+            break
+        except Exception:
+            continue
+    if txt is None:
+        return None, None
+
+    try:
+        root = ET.fromstring(txt)
+    except ET.ParseError:
+        return None, None
+
+    desc_tag = f"{{{RDF_NS}}}Description"
+    rating_attr = f"{{{XMP_NS}}}Rating"
+    rating_tag = f"{{{XMP_NS}}}Rating"
+    label_attr = f"{{{XMP_NS}}}Label"
+    label_tag = f"{{{XMP_NS}}}Label"
+
+    rating: Optional[int] = None
+    label: Optional[str] = None
+
+    for e in root.iter():
+        if e.tag == desc_tag:
+            if rating is None:
+                v = e.attrib.get(rating_attr)
+                if v is not None:
+                    try:
+                        rating = int(str(v).strip())
+                    except Exception:
+                        pass
+            if label is None:
+                lv = e.attrib.get(label_attr)
+                if lv is not None:
+                    lv2 = str(lv).strip()
+                    if lv2:
+                        label = lv2
+
+    if rating is None:
+        for e in root.iter():
+            if e.tag == rating_tag and e.text is not None:
+                t = e.text.strip()
+                if t:
+                    try:
+                        rating = int(t)
+                        break
+                    except Exception:
+                        pass
+
+    if label is None:
+        for e in root.iter():
+            if e.tag == label_tag and e.text is not None:
+                t = e.text.strip()
+                if t:
+                    label = t
+                    break
+
+    return rating, label
+
+
+def robust_read_xmp_rating_and_label(path: Path) -> Tuple[Optional[int], Optional[str]]:
+    ext = path.suffix.lower()
+    if ext not in (".jpg", ".jpeg"):
+        return None, None
+
+    xmp_xml = _extract_xmp_packet_from_jpeg(path)
+    return _parse_xmp_rating_and_label_from_xml(xmp_xml)
 
 
 @dataclass
@@ -74,10 +213,10 @@ class Photo:
 
 @dataclass
 class ProductSet:
-    photos_by_rating: Dict[int, Photo]
-    starter_rating: int
+    photos: List[Photo]
+    anchor: Photo
     barcode: Optional[str] = None
-    barcode_source_rating: Optional[int] = None
+    barcode_source_path: Optional[Path] = None
 
 
 def extractIndex(path: Path) -> int:
@@ -88,6 +227,12 @@ def extractIndex(path: Path) -> int:
 def sanitizeBarcodeForFileName(barcode_text: str) -> str:
     sanitized = re.sub(r"[^\dA-Za-z]+", "_", (barcode_text or "")).strip("_")
     return sanitized or "barcode"
+
+
+def sanitizeStemToken(token: str) -> str:
+    token = (token or "").strip()
+    token = re.sub(r"[^\dA-Za-z]+", "_", token).strip("_")
+    return token or "img"
 
 
 def getPhotoTimestamp(path: Path) -> datetime:
@@ -163,9 +308,11 @@ def _prepare_scan_path(path: Path) -> Tuple[Path, Optional[Path]]:
 
 def _read_xmp_rating(path: Path) -> Tuple[Optional[int], Optional[str]]:
     try:
-        meta = read_xmp_rating_and_label(path)
-        return meta.rating, meta.label
-    except Exception:
+        return robust_read_xmp_rating_and_label(path)
+    except Exception as e:
+        print(
+            f"[XMP] ERROR reading rating/label from {path.name}: {type(e).__name__}: {e}"
+        )
         return None, None
 
 
@@ -219,7 +366,7 @@ def moveToBad(path: Path, reason: str = ""):
 
 
 def move_set_to_bad(ps: ProductSet, reason: str):
-    for ph in ps.photos_by_rating.values():
+    for ph in ps.photos:
         moveToBad(ph.path, reason=reason)
 
 
@@ -237,66 +384,37 @@ def _safe_rename(src: Path, dest: Path) -> Path:
 
 def build_product_sets(block: List[Photo]) -> List[ProductSet]:
     sets: List[ProductSet] = []
-    cur: Dict[int, Photo] = {}
-    starter_rating: Optional[int] = None
-    in_set = False
+    cur_photos: List[Photo] = []
+    cur_anchor: Optional[Photo] = None
 
     def flush_current():
-        nonlocal cur, starter_rating, in_set
-        if not cur:
-            starter_rating = None
-            in_set = False
+        nonlocal cur_photos, cur_anchor
+        if cur_anchor is None or not cur_photos:
+            cur_photos = []
+            cur_anchor = None
             return
-        sets.append(
-            ProductSet(photos_by_rating=cur, starter_rating=starter_rating or 4)
-        )
-        cur = {}
-        starter_rating = None
-        in_set = False
+        sets.append(ProductSet(photos=cur_photos, anchor=cur_anchor))
+        cur_photos = []
+        cur_anchor = None
 
     for ph in block:
         r = ph.rating
 
-        if r not in ALLOWED_RATINGS:
-            moveToBad(ph.path, reason=f"unexpected_or_missing_rating={r}")
-            continue
-
-        ri = int(r)
-
-        if not in_set:
-            if ri in (4, 1):
-                in_set = True
-                starter_rating = ri
-                cur[ri] = ph
-                continue
-
-            moveToBad(ph.path, reason=f"rating_{ri}_seen_before_any_starter")
-            continue
-
-        if ri == 4 and starter_rating == 1 and 4 not in cur:
-            if set(cur.keys()) == {1}:
-                cur[4] = ph
-                starter_rating = 4
-                continue
+        if cur_anchor is None:
+            if r == ANCHOR_RATING:
+                cur_anchor = ph
+                cur_photos = [ph]
             else:
-                flush_current()
-                in_set = True
-                starter_rating = 4
-                cur[4] = ph
-                continue
+                moveToBad(ph.path, reason="seen_before_any_anchor_rating_1")
+            continue
 
-        if ri in (1, 4) and ri in cur:
+        if r == ANCHOR_RATING:
             flush_current()
-            in_set = True
-            starter_rating = ri
-            cur[ri] = ph
+            cur_anchor = ph
+            cur_photos = [ph]
             continue
 
-        if ri in cur:
-            moveToBad(ph.path, reason=f"duplicate_rating_in_set={ri}")
-            continue
-
-        cur[ri] = ph
+        cur_photos.append(ph)
 
     flush_current()
     return sets
@@ -320,33 +438,20 @@ def _try_decode_barcode(path: Path, *, require_large_region: bool) -> Optional[s
 
 
 def decode_barcode_for_set(ps: ProductSet) -> None:
-    ph4 = ps.photos_by_rating.get(4)
-    if ph4 is not None:
-        code = _try_decode_barcode(ph4.path, require_large_region=True)
+    ordered = [ps.anchor] + [ph for ph in ps.photos if ph.path != ps.anchor.path]
+
+    for i, ph in enumerate(ordered, start=1):
+        code = _try_decode_barcode(ph.path, require_large_region=True)
         if code:
             ps.barcode = code
-            ps.barcode_source_rating = 4
-            print(f"[BARCODE] decoded from rating 4 => {code}")
+            ps.barcode_source_path = ph.path
+            where = "anchor" if ph.path == ps.anchor.path else f"image_{i:02d}"
+            print(f"[BARCODE] decoded from {where} ({ph.path.name}) => {code}")
             return
-        print("[BARCODE] rating 4 present but decode failed; trying rating 1...")
-
-    ph1 = ps.photos_by_rating.get(1)
-    if ph1 is None:
-        ps.barcode = None
-        ps.barcode_source_rating = None
-        print("[BARCODE] no rating 1 available => barcode fail")
-        return
-
-    code = _try_decode_barcode(ph1.path, require_large_region=True)
-    if code:
-        ps.barcode = code
-        ps.barcode_source_rating = 1
-        print(f"[BARCODE] decoded from rating 1 => {code}")
-        return
 
     ps.barcode = None
-    ps.barcode_source_rating = None
-    print("[BARCODE] rating 1 decode failed => barcode fail")
+    ps.barcode_source_path = None
+    print("[BARCODE] failed on all images in set => barcode fail")
 
 
 def decode_barcodes_for_sets(product_sets: List[ProductSet]) -> None:
@@ -359,7 +464,7 @@ def decode_barcodes_for_sets(product_sets: List[ProductSet]) -> None:
         except Exception as e:
             ps = product_sets[i]
             ps.barcode = None
-            ps.barcode_source_rating = None
+            ps.barcode_source_path = None
             print(f"[BARCODE] ERROR decoding set {i}: {type(e).__name__}: {e}")
         return i
 
@@ -369,46 +474,29 @@ def decode_barcodes_for_sets(product_sets: List[ProductSet]) -> None:
             _ = fut.result()
 
 
-def role_from_rating_fallback(rating: Optional[int]) -> Optional[str]:
-    if rating is None:
-        return None
-    return DEFAULT_RATING_TO_ROLE.get(int(rating))
-
-
 def rename_product_set(ps: ProductSet):
     if not ps.barcode:
-        has4 = 4 in ps.photos_by_rating
-        has1 = 1 in ps.photos_by_rating
-
-        if has4 and has1:
-            move_set_to_bad(ps, reason="barcode_failed_after_try_4_then_1")
-        elif has4 and not has1:
-            move_set_to_bad(ps, reason="barcode_failed_on_4_and_no_1_fallback")
-        elif (not has4) and has1:
-            move_set_to_bad(ps, reason="barcode_failed_on_1_only_no_4_available")
-        else:
-            move_set_to_bad(ps, reason="no_4_or_1_available_for_barcode_scan")
+        move_set_to_bad(ps, reason="barcode_failed_for_entire_set")
         return
 
     barcode = sanitizeBarcodeForFileName(ps.barcode)
 
-    for rating, ph in sorted(ps.photos_by_rating.items()):
+    for idx, ph in enumerate(ps.photos, start=1):
         role, r2, label, reason = role_from_xmp(ph.path)
 
-        if not role:
-            role = role_from_rating_fallback(rating)
-            if role:
-                print(
-                    f"[ROLE] Fallback role from rating={rating} => {role} (xmp_reason={reason})"
-                )
+        if role:
+            token = sanitizeStemToken(role)
+        else:
+            if label:
+                token = sanitizeStemToken(label)
+                print(f"[ROLE] No xmp role; using label fallback => {token} ({reason})")
             else:
-                moveToBad(
-                    ph.path,
-                    reason=f"no_role_from_xmp_and_no_rating_fallback ({reason}, rating={r2}, label={label})",
+                token = f"img{idx:02d}"
+                print(
+                    f"[ROLE] No xmp role/label; using ordinal fallback => {token} ({reason})"
                 )
-                continue
 
-        dest = GOOD_DIR / f"{barcode}_{role}{ph.path.suffix.lower()}"
+        dest = GOOD_DIR / f"{barcode}_{token}{ph.path.suffix.lower()}"
         _safe_rename(ph.path, dest)
 
 
@@ -422,7 +510,8 @@ def main():
     blocks = chunk_by_reset_gap(photos)
     print(f"[INFO] Found {len(photos)} file(s) across {len(blocks)} time block(s).")
     print(
-        "[INFO] Building product sets: each set starts with rating 4 (upc) or 1 (hero); 2/3 are optional."
+        "[INFO] Building product sets: each set starts at rating 1 (anchor). "
+        "All following images belong to the set until the next rating 1."
     )
 
     all_sets: List[ProductSet] = []
@@ -432,26 +521,11 @@ def main():
         all_sets.extend(sets)
 
     if not all_sets:
-        print("[INFO] No product sets found.")
-        return
-
-    valid_sets: List[ProductSet] = []
-    for ps in all_sets:
-        if 1 not in ps.photos_by_rating:
-            move_set_to_bad(ps, reason="missing_required_hero_shot_rating_1")
-        else:
-            valid_sets.append(ps)
-
-    all_sets = valid_sets
-
-    if not all_sets:
-        print(
-            "[INFO] All detected sets were missing hero shots; nothing left to process."
-        )
+        print("[INFO] No product sets found (no rating-1 anchors).")
         return
 
     print(
-        "[INFO] Decoding barcodes: try rating 4, else try rating 1 (with large-region requirement)."
+        "[INFO] Decoding barcodes per set: try anchor first, then all images in set order."
     )
     decode_barcodes_for_sets(all_sets)
 
