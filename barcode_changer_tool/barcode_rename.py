@@ -1,35 +1,21 @@
 from __future__ import annotations
 
 import re
+import struct
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Union
 
-
-DEFAULT_RATING_TO_ROLE: Dict[int, str] = {
-    1: "hero",
-    2: "packaging",
-    3: "nutritional",
-    4: "upc",
+DEFAULT_LABEL_TO_TOKEN: Dict[str, str] = {
+    "Red": "upc",
+    "Yellow": "hero",
+    "Green": "packaging",
+    "Blue": "nutritional",
 }
 
-
-@dataclass(frozen=True)
-class XmpMeta:
-    rating: Optional[int]
-    label: Optional[str]
-
-
-@dataclass(frozen=True)
-class RenameResult:
-    original: Path
-    renamed: Optional[Path]
-    rating: Optional[int]
-    label: Optional[str]
-    role: Optional[str]
-    reason: str
-
+SOI = b"\xff\xd8"
+XMP_ID = b"http://ns.adobe.com/xap/1.0/\x00"
 
 _slug_rx = re.compile(r"[^a-z0-9]+", re.IGNORECASE)
 
@@ -53,181 +39,183 @@ def pick_nonconflicting_path(target: Path) -> Path:
         i += 1
 
 
-def extract_xmp_packet(file_bytes: bytes) -> Optional[bytes]:
-    start = file_bytes.find(b"<x:xmpmeta")
+def _normalize_adobe_label(label: str) -> str:
+    s = (label or "").strip()
+    if not s:
+        return ""
+    s = s.lower()
+    return s[:1].upper() + s[1:]
+
+
+def _localname(tag_or_attr: str) -> str:
+    if not isinstance(tag_or_attr, str):
+        return ""
+    t = tag_or_attr
+    if "}" in t:
+        t = t.split("}", 1)[1]
+    if ":" in t:
+        t = t.split(":", 1)[1]
+    return t.lower().strip()
+
+
+def _iter_jpeg_segments(data: bytes):
+    if not data.startswith(SOI):
+        return
+
+    i = 2
+    n = len(data)
+
+    while i < n:
+        if data[i] != 0xFF:
+            i += 1
+            continue
+
+        j = i
+        while j < n and data[j] == 0xFF:
+            j += 1
+        if j >= n:
+            break
+
+        marker = data[j]
+        i = j + 1
+
+        if marker == 0xD9:
+            break
+        if marker == 0xDA:
+            break
+
+        if i + 2 > n:
+            break
+
+        seglen = struct.unpack(">H", data[i : i + 2])[0]
+        seg_end = i + seglen
+        payload_start = i + 2
+        yield (marker, payload_start, seg_end)
+        i = seg_end
+
+
+def _extract_xmp_from_jpeg_bytes(data: bytes) -> Optional[bytes]:
+    if not data.startswith(SOI):
+        return None
+
+    for marker, payload_start, seg_end in _iter_jpeg_segments(data):
+        if marker != 0xE1:
+            continue
+        payload = data[payload_start:seg_end]
+        if payload.startswith(XMP_ID):
+            return payload[len(XMP_ID) :]
+    return None
+
+
+def _extract_xmpmeta_fragment_anywhere(data: bytes) -> Optional[bytes]:
+    low = data.lower()
+    start = low.find(b"<x:xmpmeta")
     if start == -1:
-        low = file_bytes.lower()
-        start = low.find(b"<x:xmpmeta")
-        if start == -1:
-            return None
-    end = file_bytes.find(b"</x:xmpmeta>", start)
+        return None
+    end = low.find(b"</x:xmpmeta>", start)
     if end == -1:
         return None
     end += len(b"</x:xmpmeta>")
-    return file_bytes[start:end]
+    return data[start:end]
 
 
-def localname(tag: str) -> str:
-    if not isinstance(tag, str):
-        return ""
-    if "}" in tag:
-        tag = tag.split("}", 1)[1]
-    if ":" in tag:
-        tag = tag.split(":", 1)[1]
-    return tag.lower().strip()
+def _parse_xmp_label_only(xmp_xml_bytes: bytes) -> Optional[str]:
+    if not xmp_xml_bytes:
+        return None
 
-
-def read_xmp_rating_and_label(image_path: Union[str, Path]) -> XmpMeta:
-    p = Path(image_path)
-
-    try:
-        data = p.read_bytes()
-    except Exception:
-        return XmpMeta(None, None)
-
-    xmp = extract_xmp_packet(data)
-    if not xmp:
-        return XmpMeta(None, None)
+    txt = None
+    for enc in ("utf-8", "utf-8-sig", "latin-1"):
+        try:
+            txt = xmp_xml_bytes.decode(enc, errors="replace")
+            break
+        except Exception:
+            continue
+    if txt is None:
+        return None
 
     try:
-        root = ET.fromstring(xmp.decode("utf-8", errors="ignore"))
+        root = ET.fromstring(txt)
     except Exception:
-        return XmpMeta(None, None)
+        return None
 
-    rating: Optional[int] = None
     label: Optional[str] = None
 
     for elem in root.iter():
         for k, v in elem.attrib.items():
-            kname = localname(str(k))
+            if _localname(str(k)) == "label":
+                sv = str(v).strip()
+                if sv:
+                    return sv
 
-            if rating is None and kname == "rating":
-                try:
-                    rating = int(str(v).strip())
-                except Exception:
-                    pass
+    for elem in root.iter():
+        if _localname(elem.tag) == "label":
+            t = (elem.text or "").strip()
+            if t:
+                return t
 
-            if label is None and kname == "label":
-                txt = str(v).strip()
-                if txt:
-                    label = txt
+    return label
 
-        if rating is not None and label is not None:
-            break
 
-    if rating is None or label is None:
-        for elem in root.iter():
-            lname = localname(elem.tag)
+@dataclass(frozen=True)
+class XmpMeta:
+    label: Optional[str]
 
-            if rating is None and lname == "rating":
-                txt = (elem.text or "").strip()
-                if txt:
-                    try:
-                        rating = int(txt)
-                    except Exception:
-                        pass
 
-            if label is None and lname == "label":
-                txt = (elem.text or "").strip()
-                if txt:
-                    label = txt
+def read_xmp_label(image_path: Union[str, Path]) -> XmpMeta:
+    p = Path(image_path)
+    try:
+        data = p.read_bytes()
+    except Exception:
+        return XmpMeta(None)
 
-            if rating is not None and label is not None:
-                break
+    xmp_bytes: Optional[bytes] = None
 
-    return XmpMeta(rating=rating, label=label)
+    if p.suffix.lower() in (".jpg", ".jpeg"):
+        xmp_bytes = _extract_xmp_from_jpeg_bytes(data)
+
+    if not xmp_bytes:
+        frag = _extract_xmpmeta_fragment_anywhere(data)
+        if frag:
+            xmp_bytes = frag
+
+    if not xmp_bytes:
+        return XmpMeta(None)
+
+    label = _parse_xmp_label_only(xmp_bytes)
+    return XmpMeta(label=label)
+
+
+def token_from_color_label(
+    label: Optional[str],
+    label_to_token: Optional[Dict[str, str]] = None,
+) -> Optional[str]:
+    if not label:
+        return None
+    mapping = label_to_token or DEFAULT_LABEL_TO_TOKEN
+    norm = _normalize_adobe_label(label)
+    return mapping.get(norm)
+
+
+def token_from_xmp_label(
+    image_path: Union[str, Path],
+    label_to_token: Optional[Dict[str, str]] = None,
+) -> tuple[Optional[str], Optional[str], str]:
+    meta = read_xmp_label(image_path)
+    label = meta.label
+
+    if not label:
+        return None, None, "no_xmp_label_found"
+
+    token = token_from_color_label(label, label_to_token=label_to_token)
+    if not token:
+        return None, label, "unmapped_label"
+
+    return token, label, "ok"
 
 
 def role_from_xmp(
     image_path: Union[str, Path],
-    rating_to_role: Optional[Dict[int, str]] = None,
+    rating_to_role=None,
 ) -> tuple[Optional[str], Optional[int], Optional[str], str]:
-    rating_to_role = rating_to_role or DEFAULT_RATING_TO_ROLE
-    p = Path(image_path)
-
-    meta = read_xmp_rating_and_label(p)
-    rating, label = meta.rating, meta.label
-
-    if rating is None and (label is None or label == ""):
-        return None, rating, label, "no_xmp_rating_or_label_found"
-
-    role = rating_to_role.get(rating) if rating is not None else None
-    if role is None:
-        return None, rating, label, "unmapped_rating"
-
-    return role, rating, label, "ok"
-
-
-def rename_with_role_barcode(
-    image_path: Union[str, Path],
-    *,
-    role: str,
-    barcode: str,
-    kind: str,
-    index: int,
-    dry_run: bool = False,
-) -> RenameResult:
-    p = Path(image_path)
-
-    try:
-        if not role:
-            return RenameResult(p, None, None, None, None, "skipped_no_role")
-        if not barcode:
-            return RenameResult(p, None, None, None, None, "skipped_no_barcode")
-
-        ext = p.suffix.lower()
-        kind_s = slugify(kind)
-        new_name = f"{role}_{barcode}_{kind_s}_{index}{ext}"
-        target = pick_nonconflicting_path(p.with_name(new_name))
-
-        if not dry_run:
-            p.rename(target)
-
-        return RenameResult(p, target, None, None, role, "renamed")
-    except Exception as e:
-        return RenameResult(
-            Path(image_path), None, None, None, None, f"error: {type(e).__name__}"
-        )
-
-
-def rename_image_by_lr_xmp(
-    image_path: Union[str, Path],
-    rating_to_role: Optional[Dict[int, str]] = None,
-    prefer: str = "rating",
-    label_to_role: Optional[Dict[str, str]] = None,
-    dry_run: bool = False,
-) -> RenameResult:
-    rating_to_role = rating_to_role or DEFAULT_RATING_TO_ROLE
-    p = Path(image_path)
-
-    try:
-        meta = read_xmp_rating_and_label(p)
-        rating, label = meta.rating, meta.label
-
-        role: Optional[str] = None
-        prefer_l = (prefer or "").lower().strip()
-
-        if prefer_l == "rating":
-            role = rating_to_role.get(rating) if rating is not None else None
-        elif prefer_l == "label":
-            if label_to_role and label:
-                role = label_to_role.get(label)
-        else:
-            role = rating_to_role.get(rating) if rating is not None else None
-            if role is None and label_to_role and label:
-                role = label_to_role.get(label)
-
-        if role is None:
-            if rating is None and (label is None or label == ""):
-                return RenameResult(p, None, None, None, None, "skipped_no_xmp")
-            return RenameResult(p, None, rating, label, None, "skipped_unmapped")
-
-        new_name = f"{role}__{slugify(p.stem)}{p.suffix.lower()}"
-        target = pick_nonconflicting_path(p.with_name(new_name))
-
-        if not dry_run:
-            p.rename(target)
-
-        return RenameResult(p, target, rating, label, role, "renamed")
-    except Exception:
-        return RenameResult(Path(image_path), None, None, None, None, "error")
+    token, label, reason = token_from_xmp_label(image_path)
+    return token, None, label, reason

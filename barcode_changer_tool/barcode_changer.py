@@ -2,12 +2,11 @@ import os
 
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 import threading
-
-YOLO_LOCK = threading.Lock()
-
-import re, subprocess, time, struct
-import xml.etree.ElementTree as ET
+import re
+import subprocess
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -15,7 +14,13 @@ from typing import List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from barcode_changer_tool.barcode_reader import readBarcode_hf_status, BarcodeStatus
-from barcode_changer_tool.barcode_rename import role_from_xmp
+from barcode_changer_tool.barcode_rename import (
+    read_xmp_rating_and_label,
+    token_from_color_label,
+    role_from_xmp,
+)
+
+YOLO_LOCK = threading.Lock()
 
 for var in (
     "OMP_NUM_THREADS",
@@ -31,9 +36,10 @@ try:
 except ImportError:
     Image = None
 
+
 INPUT_DIR = Path("input")
-GOOD_DIR = Path("good")
-BAD_DIR = Path("bad")
+GOOD_DIR = Path("good_color")
+BAD_DIR = Path("bad_color")
 
 SUPPORTED_EXTS = {
     ".jpg",
@@ -54,152 +60,6 @@ RAW_EXTS = {".nef", ".arw", ".cr2", ".cr3"}
 RESET_GAP_SEC = 120.0
 ANCHOR_RATING = 1
 MAX_WORKERS = min(8, (os.cpu_count() or 4))
-
-SOI = b"\xff\xd8"
-XMP_ID = b"http://ns.adobe.com/xap/1.0/\x00"
-XMP_NS = "http://ns.adobe.com/xap/1.0/"
-RDF_NS = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
-
-
-def _iter_jpeg_segments(data: bytes):
-    if not data.startswith(SOI):
-        return
-
-    i = 2
-    n = len(data)
-
-    while i < n:
-        if data[i] != 0xFF:
-            i += 1
-            continue
-
-        j = i
-        while j < n and data[j] == 0xFF:
-            j += 1
-        if j >= n:
-            break
-
-        marker = data[j]
-        i = j + 1
-
-        if marker == 0xD9:
-            yield (marker, j - 1, i, i)
-            break
-
-        if marker == 0xDA:
-            if i + 2 > n:
-                break
-            seglen = struct.unpack(">H", data[i : i + 2])[0]
-            seg_start = j - 1
-            seg_end = i + seglen
-            payload_start = i + 2
-            yield (marker, seg_start, seg_end, payload_start)
-            break
-
-        if i + 2 > n:
-            break
-
-        seglen = struct.unpack(">H", data[i : i + 2])[0]
-        seg_start = j - 1
-        seg_end = i + seglen
-        payload_start = i + 2
-        yield (marker, seg_start, seg_end, payload_start)
-        i = seg_end
-
-
-def _extract_xmp_packet_from_jpeg(jpeg_path: Path) -> Optional[bytes]:
-    try:
-        data = jpeg_path.read_bytes()
-    except Exception:
-        return None
-
-    if not data.startswith(SOI):
-        return None
-
-    for marker, seg_start, seg_end, payload_start in _iter_jpeg_segments(data):
-        if marker != 0xE1:
-            continue
-        payload = data[payload_start:seg_end]
-        if payload.startswith(XMP_ID):
-            return payload[len(XMP_ID) :]
-    return None
-
-
-def _parse_xmp_rating_and_label_from_xml(
-    xmp_xml_bytes: bytes,
-) -> Tuple[Optional[int], Optional[str]]:
-    if not xmp_xml_bytes:
-        return None, None
-
-    txt = None
-    for enc in ("utf-8", "utf-8-sig", "latin-1"):
-        try:
-            txt = xmp_xml_bytes.decode(enc, errors="replace")
-            break
-        except Exception:
-            continue
-    if txt is None:
-        return None, None
-
-    try:
-        root = ET.fromstring(txt)
-    except ET.ParseError:
-        return None, None
-
-    desc_tag = f"{{{RDF_NS}}}Description"
-    rating_attr = f"{{{XMP_NS}}}Rating"
-    rating_tag = f"{{{XMP_NS}}}Rating"
-    label_attr = f"{{{XMP_NS}}}Label"
-    label_tag = f"{{{XMP_NS}}}Label"
-
-    rating: Optional[int] = None
-    label: Optional[str] = None
-
-    for e in root.iter():
-        if e.tag == desc_tag:
-            if rating is None:
-                v = e.attrib.get(rating_attr)
-                if v is not None:
-                    try:
-                        rating = int(str(v).strip())
-                    except Exception:
-                        pass
-            if label is None:
-                lv = e.attrib.get(label_attr)
-                if lv is not None:
-                    lv2 = str(lv).strip()
-                    if lv2:
-                        label = lv2
-
-    if rating is None:
-        for e in root.iter():
-            if e.tag == rating_tag and e.text is not None:
-                t = e.text.strip()
-                if t:
-                    try:
-                        rating = int(t)
-                        break
-                    except Exception:
-                        pass
-
-    if label is None:
-        for e in root.iter():
-            if e.tag == label_tag and e.text is not None:
-                t = e.text.strip()
-                if t:
-                    label = t
-                    break
-
-    return rating, label
-
-
-def robust_read_xmp_rating_and_label(path: Path) -> Tuple[Optional[int], Optional[str]]:
-    ext = path.suffix.lower()
-    if ext not in (".jpg", ".jpeg"):
-        return None, None
-
-    xmp_xml = _extract_xmp_packet_from_jpeg(path)
-    return _parse_xmp_rating_and_label_from_xml(xmp_xml)
 
 
 @dataclass
@@ -254,6 +114,7 @@ def getPhotoTimestamp(path: Path) -> datetime:
                         continue
     except Exception:
         return ts
+
     return ts
 
 
@@ -306,16 +167,6 @@ def _prepare_scan_path(path: Path) -> Tuple[Path, Optional[Path]]:
     return tmp_png, tmp_png
 
 
-def _read_xmp_rating(path: Path) -> Tuple[Optional[int], Optional[str]]:
-    try:
-        return robust_read_xmp_rating_and_label(path)
-    except Exception as e:
-        print(
-            f"[XMP] ERROR reading rating/label from {path.name}: {type(e).__name__}: {e}"
-        )
-        return None, None
-
-
 def loadPhotos() -> List[Photo]:
     files = listInputFiles()
     if not files:
@@ -325,10 +176,18 @@ def loadPhotos() -> List[Photo]:
     photos: List[Photo] = []
     for p in files:
         ts = getPhotoTimestamp(p)
-        idx = extractIndex(p)
-        rating, label = _read_xmp_rating(p)
+
+        meta = read_xmp_rating_and_label(p)
+        rating, label = meta.rating, meta.label
+
         photos.append(
-            Photo(path=p, timestamp=ts, index=idx, rating=rating, label=label)
+            Photo(
+                path=p,
+                timestamp=ts,
+                index=extractIndex(p),
+                rating=rating,
+                label=label,
+            )
         )
 
     photos.sort(key=lambda ph: (ph.timestamp, ph.index))
@@ -482,19 +341,32 @@ def rename_product_set(ps: ProductSet):
     barcode = sanitizeBarcodeForFileName(ps.barcode)
 
     for idx, ph in enumerate(ps.photos, start=1):
-        role, r2, label, reason = role_from_xmp(ph.path)
+        meta = read_xmp_rating_and_label(ph.path)
+        rating, label = meta.rating, meta.label
 
-        if role:
-            token = sanitizeStemToken(role)
-        else:
-            if label:
-                token = sanitizeStemToken(label)
-                print(f"[ROLE] No xmp role; using label fallback => {token} ({reason})")
-            else:
-                token = f"img{idx:02d}"
-                print(
-                    f"[ROLE] No xmp role/label; using ordinal fallback => {token} ({reason})"
-                )
+        role, _r2, _l2, reason = role_from_xmp(ph.path)
+        token: Optional[str] = None
+
+        mapped = token_from_color_label(label)
+        if mapped:
+            token = mapped
+
+        if not token and role:
+            token = str(role).strip().lower()
+
+        if not token and label:
+            token = str(label).strip().lower()
+            print(
+                f"[ROLE] No mapped color/role; using label fallback => {token} ({reason})"
+            )
+
+        if not token:
+            token = f"img{idx:02d}"
+            print(
+                f"[ROLE] No xmp role/label; using ordinal fallback => {token} ({reason})"
+            )
+
+        token = sanitizeStemToken(token).lower()
 
         dest = GOOD_DIR / f"{barcode}_{token}{ph.path.suffix.lower()}"
         _safe_rename(ph.path, dest)
