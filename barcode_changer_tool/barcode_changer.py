@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from barcode_changer_tool.barcode_reader import readBarcode_hf_status, BarcodeStatus
 from barcode_changer_tool.barcode_rename import (
-    read_xmp_rating_and_label,
+    read_xmp_label,
     token_from_color_label,
     role_from_xmp,
 )
@@ -177,7 +177,7 @@ def loadPhotos() -> List[Photo]:
     for p in files:
         ts = getPhotoTimestamp(p)
 
-        meta = read_xmp_rating_and_label(p)
+        meta = read_xmp_label(p)
         rating, label = meta.rating, meta.label
 
         photos.append(
@@ -341,7 +341,7 @@ def rename_product_set(ps: ProductSet):
     barcode = sanitizeBarcodeForFileName(ps.barcode)
 
     for idx, ph in enumerate(ps.photos, start=1):
-        meta = read_xmp_rating_and_label(ph.path)
+        meta = read_xmp_label(ph.path)
         rating, label = meta.rating, meta.label
 
         role, _r2, _l2, reason = role_from_xmp(ph.path)
