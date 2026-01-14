@@ -79,7 +79,7 @@ def _iter_jpeg_segments(data: bytes):
         marker = data[j]
         i = j + 1
 
-        if marker in (0xD9, 0xDA):  # EOI or SOS
+        if marker in (0xD9, 0xDA):
             break
 
         if i + 2 > n:
