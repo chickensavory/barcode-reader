@@ -178,7 +178,12 @@ def _parse_xmp_label_and_rating(xmp_xml_bytes: bytes) -> XmpMeta:
 
 
 def _xmp_sidecar_path(image_path: Path) -> Path:
-    return image_path.with_suffix(".xmp")
+    p1 = image_path.with_suffix(".xmp")
+    if p1.exists():
+        return p1
+
+    p2 = image_path.with_name(image_path.name + ".xmp")
+    return p2
 
 
 def _read_xmp_packet_bytes_from_file(image_path: Path) -> Optional[bytes]:
