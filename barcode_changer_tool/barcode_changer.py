@@ -8,7 +8,6 @@ import re
 import subprocess
 import time
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -55,9 +54,13 @@ SUPPORTED_EXTS = {
     ".cr3",
 }
 
-RAW_EXTS = {".nef", ".arw", ".cr2", ".cr3"}
+RAW_EXTS = {
+    ".nef",
+    ".arw",
+    ".cr2",
+    ".cr3",
+}
 
-RESET_GAP_SEC = 120.0
 ANCHOR_RATING = 1
 MAX_WORKERS = min(8, (os.cpu_count() or 4))
 
@@ -65,7 +68,6 @@ MAX_WORKERS = min(8, (os.cpu_count() or 4))
 @dataclass
 class Photo:
     path: Path
-    timestamp: datetime
     index: int
     rating: Optional[int]
     label: Optional[str]
@@ -80,8 +82,21 @@ class ProductSet:
 
 
 def extractIndex(path: Path) -> int:
-    m = re.search(r"\((\d+)\)", path.stem)
-    return int(m.group(1)) if m else 999999
+    stem = path.stem
+
+    m = re.search(r"\((\d+)\)", stem)
+    if m:
+        return int(m.group(1))
+
+    m = re.match(r"^\s*(\d+)", stem)
+    if m:
+        return int(m.group(1))
+
+    nums = re.findall(r"(\d+)", stem)
+    if nums:
+        return int(nums[-1])
+
+    return 999999
 
 
 def sanitizeBarcodeForFileName(barcode_text: str) -> str:
@@ -93,29 +108,6 @@ def sanitizeStemToken(token: str) -> str:
     token = (token or "").strip()
     token = re.sub(r"[^\dA-Za-z]+", "_", token).strip("_")
     return token or "img"
-
-
-def getPhotoTimestamp(path: Path) -> datetime:
-    ts = datetime.fromtimestamp(path.stat().st_mtime)
-    if Image is None:
-        return ts
-
-    try:
-        with Image.open(path) as im:
-            exif = getattr(im, "_getexif", lambda: None)()
-            if not exif:
-                return ts
-            for tag in (36867, 406):
-                value = exif.get(tag)
-                if isinstance(value, str):
-                    try:
-                        return datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
-                    except Exception:
-                        continue
-    except Exception:
-        return ts
-
-    return ts
 
 
 def listInputFiles() -> List[Path]:
@@ -146,7 +138,7 @@ def convertRawToTempPNG(raw_path: Path) -> Optional[Path]:
             return None
     except FileNotFoundError:
         print(
-            "[RAW] ERROR: 'sips' not found (macOS-only). RAW barcode scan will be skipped."
+            "[RAW] ERROR: 'sips' not found. RAW barcode scan will be skipped."
         )
         return None
 
@@ -175,39 +167,20 @@ def loadPhotos() -> List[Photo]:
 
     photos: List[Photo] = []
     for p in files:
-        ts = getPhotoTimestamp(p)
-
         meta = read_xmp_label(p)
         rating, label = meta.rating, meta.label
 
         photos.append(
             Photo(
                 path=p,
-                timestamp=ts,
                 index=extractIndex(p),
                 rating=rating,
                 label=label,
             )
         )
 
-    photos.sort(key=lambda ph: (ph.timestamp, ph.index))
+    photos.sort(key=lambda ph: (ph.index, ph.path.name.lower()))
     return photos
-
-
-def chunk_by_reset_gap(photos: List[Photo]) -> List[List[Photo]]:
-    if not photos:
-        return []
-    chunks: List[List[Photo]] = []
-    cur = [photos[0]]
-    for prev, nxt in zip(photos, photos[1:]):
-        gap = (nxt.timestamp - prev.timestamp).total_seconds()
-        if gap > RESET_GAP_SEC:
-            chunks.append(cur)
-            cur = [nxt]
-        else:
-            cur.append(nxt)
-    chunks.append(cur)
-    return chunks
 
 
 def moveToBad(path: Path, reason: str = ""):
@@ -241,7 +214,7 @@ def _safe_rename(src: Path, dest: Path) -> Path:
     return candidate
 
 
-def build_product_sets(block: List[Photo]) -> List[ProductSet]:
+def build_product_sets(photos_in_order: List[Photo]) -> List[ProductSet]:
     sets: List[ProductSet] = []
     cur_photos: List[Photo] = []
     cur_anchor: Optional[Photo] = None
@@ -256,7 +229,7 @@ def build_product_sets(block: List[Photo]) -> List[ProductSet]:
         cur_photos = []
         cur_anchor = None
 
-    for ph in block:
+    for ph in photos_in_order:
         r = ph.rating
 
         if cur_anchor is None:
@@ -379,18 +352,15 @@ def main():
     if not photos:
         return
 
-    blocks = chunk_by_reset_gap(photos)
-    print(f"[INFO] Found {len(photos)} file(s) across {len(blocks)} time block(s).")
+    print(f"[INFO] Found {len(photos)} file(s).")
+    print("[INFO] Ordering: filename/sequence ONLY. Timestamps are ignored completely.")
     print(
         "[INFO] Building product sets: each set starts at rating 1 (anchor). "
         "All following images belong to the set until the next rating 1."
     )
 
-    all_sets: List[ProductSet] = []
-    for bi, block in enumerate(blocks, start=1):
-        sets = build_product_sets(block)
-        print(f"[INFO] Block {bi}: {len(sets)} product set(s).")
-        all_sets.extend(sets)
+    all_sets = build_product_sets(photos)
+    print(f"[INFO] Built {len(all_sets)} product set(s).")
 
     if not all_sets:
         print("[INFO] No product sets found (no rating-1 anchors).")
