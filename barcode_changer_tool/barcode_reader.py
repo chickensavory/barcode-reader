@@ -134,32 +134,63 @@ def _rotate(img_bgr: np.ndarray, angle: int) -> np.ndarray:
     return cv2.warpAffine(img_bgr, M, (w, h))
 
 
+def _iter_preprocessed_grays_fast(img_bgr: np.ndarray):
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    yield gray
+
+    try:
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray_clahe = clahe.apply(gray)
+        yield gray_clahe
+    except Exception:
+        gray_clahe = gray
+
+    _t, otsu = cv2.threshold(gray_clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    yield otsu
+
+    try:
+        adap = cv2.adaptiveThreshold(
+            gray_clahe,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            31,
+            5,
+        )
+        yield adap
+    except Exception:
+        pass
+
+    blur = cv2.GaussianBlur(gray_clahe, (3, 3), 0)
+    _t, otsu_blur = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    yield otsu_blur
+
+
 def _zxing_decode(img_bgr: np.ndarray) -> Optional[str]:
     if img_bgr is None or img_bgr.size == 0:
         return None
 
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-
-    try:
-        results = zxingcpp.read_barcodes(gray) or []
-    except Exception:
-        return None
-
-    for res in results:
-        if not getattr(res, "valid", True):
+    for gray in _iter_preprocessed_grays_fast(img_bgr):
+        try:
+            results = zxingcpp.read_barcodes(gray) or []
+        except Exception:
             continue
 
-        fmt = getattr(res, "format", None)
-        if fmt is not None and fmt not in ALLOWED_ZX_FORMATS:
-            continue
+        for res in results:
+            if not getattr(res, "valid", True):
+                continue
 
-        raw = (res.text or "").strip()
-        if not raw:
-            continue
+            fmt = getattr(res, "format", None)
+            if fmt is not None and fmt not in ALLOWED_ZX_FORMATS:
+                continue
 
-        cand = extract_upc_candidate(raw)
-        if cand and is_valid_upc_ean(cand):
-            return cand
+            raw = (res.text or "").strip()
+            if not raw:
+                continue
+
+            cand = extract_upc_candidate(raw)
+            if cand and is_valid_upc_ean(cand):
+                return cand
 
     return None
 
