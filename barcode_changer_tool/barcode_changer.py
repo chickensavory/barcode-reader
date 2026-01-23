@@ -18,6 +18,7 @@ from barcode_changer_tool.barcode_rename import (
     read_xmp_label,
     token_from_color_label,
     role_from_xmp,
+    write_processed_tags,
 )
 
 YOLO_LOCK = threading.Lock()
@@ -307,76 +308,30 @@ def decode_barcodes_for_sets(product_sets: List[ProductSet]) -> None:
             _ = fut.result()
 
 
-def _xmp_sidecar_path_for_raw(image_path: Path) -> Path:
-    p1 = image_path.with_suffix(".xmp")
-    if p1.exists():
-        return p1
-    return image_path.with_name(image_path.name + ".xmp")
-
-
-def _add_processed_xmp_tags(
-    image_path: Path,
+def _add_processed_tags_after_successful_rename(
+    image_path_in_good: Path,
     *,
     tool: str = PROCESS_TOOL,
     processed_date: Optional[str] = None,
 ) -> bool:
     processed_date = processed_date or date.today().isoformat()
-    kw = f"ProcessedWith:{tool}"
-    desc = f"Processed by {tool} on {processed_date}"
 
-    try:
-        subprocess.run(["exiftool", "-ver"], capture_output=True, text=True, check=True)
-    except Exception:
+    ok = write_processed_tags(
+        image_path_in_good,
+        tool=tool,
+        processed_date=processed_date,
+        write_sidecar=True,
+        embed_jpeg=True,
+    )
+
+    if ok:
         print(
-            f"[XMP] exiftool not available; skipping processed tags for {image_path.name}"
+            f"[XMP] tagged: {image_path_in_good.name} (tool={tool} date={processed_date})"
         )
-        return False
+    else:
+        print(f"[XMP] FAILED to tag: {image_path_in_good.name}")
 
-    is_raw = image_path.suffix.lower() in RAW_EXTS
-    try:
-        if is_raw:
-            sidecar = _xmp_sidecar_path_for_raw(image_path)
-            if sidecar.exists():
-                cmd = [
-                    "exiftool",
-                    "-overwrite_original",
-                    f"-XMP-dc:Subject+={kw}",
-                    f"-XMP-dc:Description={desc}",
-                    str(sidecar),
-                ]
-            else:
-                cmd = [
-                    "exiftool",
-                    "-overwrite_original",
-                    "-o",
-                    str(sidecar),
-                    f"-XMP-dc:Subject+={kw}",
-                    f"-XMP-dc:Description={desc}",
-                    str(image_path),
-                ]
-        else:
-            cmd = [
-                "exiftool",
-                "-overwrite_original",
-                f"-XMP-dc:Subject+={kw}",
-                f"-XMP-dc:Description={desc}",
-                str(image_path),
-            ]
-
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            err = (result.stderr or "").strip()
-            print(f"[XMP] Failed to write processed tags for {image_path.name}: {err}")
-            return False
-
-        print(f"[XMP] tagged: {image_path.name} (+{kw}; desc date {processed_date})")
-        return True
-
-    except Exception as e:
-        print(
-            f"[XMP] ERROR writing processed tags for {image_path.name}: {type(e).__name__}: {e}"
-        )
-        return False
+    return ok
 
 
 def rename_product_set(ps: ProductSet):
@@ -414,7 +369,6 @@ def rename_product_set(ps: ProductSet):
             )
 
         token = sanitizeStemToken(token).lower()
-
         dest = GOOD_DIR / f"{barcode}_{token}{ph.path.suffix.lower()}"
 
         try:
@@ -423,12 +377,13 @@ def rename_product_set(ps: ProductSet):
             print(
                 f"[RENAME] ERROR: could not rename {ph.path.name}: {type(e).__name__}: {e}"
             )
-
             moveToBad(ph.path, reason="rename_failed")
             continue
 
-        _add_processed_xmp_tags(
-            new_path, tool=PROCESS_TOOL, processed_date=processed_date
+        _add_processed_tags_after_successful_rename(
+            new_path,
+            tool=PROCESS_TOOL,
+            processed_date=processed_date,
         )
 
 
