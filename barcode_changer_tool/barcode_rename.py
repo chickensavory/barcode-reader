@@ -577,24 +577,21 @@ def write_processed_tags(
     *,
     tool: str = DEFAULT_PROCESS_TOOL,
     processed_date: Optional[str] = None,
-    write_sidecar: bool = True,
-    embed_jpeg: bool = True,
 ) -> bool:
     p = Path(image_path)
     processed_date = processed_date or _date.today().isoformat()
 
-    ok_any = False
+    ext = p.suffix.lower()
 
-    if write_sidecar:
-        ok_any = (
-            write_processed_xmp_sidecar(p, tool=tool, processed_date=processed_date)
-            or ok_any
+    if ext in (".jpg", ".jpeg"):
+        return write_processed_xmp_embed_jpeg(
+            p,
+            tool=tool,
+            processed_date=processed_date,
         )
 
-    if embed_jpeg and p.suffix.lower() in (".jpg", ".jpeg"):
-        ok_any = (
-            write_processed_xmp_embed_jpeg(p, tool=tool, processed_date=processed_date)
-            or ok_any
-        )
-
-    return ok_any
+    return write_processed_xmp_sidecar(
+        p,
+        tool=tool,
+        processed_date=processed_date,
+    )
