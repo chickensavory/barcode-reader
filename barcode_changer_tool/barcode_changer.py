@@ -21,8 +21,8 @@ from barcode_changer_tool.barcode_reader import readBarcode_hf_status, BarcodeSt
 from barcode_changer_tool.barcode_rename import (
     read_xmp_label,
     token_from_color_label,
-    role_from_xmp,
     write_processed_tags,
+    write_processed_xmp_sidecar,
 )
 
 TRACK_ENDPOINT = os.environ.get(
@@ -32,6 +32,69 @@ TRACK_ENDPOINT = os.environ.get(
 KEYCHAIN_SERVICE = "barcode-changer-tracker"
 KEYCHAIN_ACCOUNT_HF = "hf_token"
 KEYCHAIN_ACCOUNT_TRACKER = "tracker_token"
+
+YOLO_LOCK = threading.Lock()
+
+for var in (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ.setdefault(var, "1")
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+
+
+INPUT_DIR = Path("input")
+GOOD_DIR = Path("good")
+BAD_DIR = Path("bad")
+
+SUPPORTED_EXTS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".tif",
+    ".tiff",
+    ".dng",
+    ".bmp",
+    ".nef",
+    ".arw",
+    ".cr2",
+    ".cr3",
+}
+
+RAW_EXTS = {
+    ".nef",
+    ".arw",
+    ".cr2",
+    ".cr3",
+}
+
+ANCHOR_RATING = 1
+MAX_WORKERS = min(8, (os.cpu_count() or 4))
+
+PROCESS_TOOL = "barcode-changer"
+
+
+@dataclass
+class Photo:
+    path: Path
+    index: int
+    rating: Optional[int]
+    label: Optional[str]
+
+
+@dataclass
+class ProductSet:
+    photos: List[Photo]
+    anchor: Photo
+    barcode: Optional[str] = None
+    barcode_source_path: Optional[Path] = None
 
 
 def _keychain_get(account: str) -> Optional[str]:
@@ -80,6 +143,25 @@ def _keychain_set(account: str, secret: str) -> bool:
                 account,
                 "-w",
                 secret,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+def _keychain_delete(account: str) -> bool:
+    try:
+        res = subprocess.run(
+            [
+                "security",
+                "delete-generic-password",
+                "-s",
+                KEYCHAIN_SERVICE,
+                "-a",
+                account,
             ],
             capture_output=True,
             text=True,
@@ -157,70 +239,6 @@ def _post_run_counts(
         print(f"[TRACK] FAILED ({e.code}): {body[:700].strip()}")
     except Exception as e:
         print(f"[TRACK] FAILED: {type(e).__name__}: {e}")
-
-
-YOLO_LOCK = threading.Lock()
-
-for var in (
-    "OMP_NUM_THREADS",
-    "OPENBLAS_NUM_THREADS",
-    "MKL_NUM_THREADS",
-    "VECLIB_MAXIMUM_THREADS",
-    "NUMEXPR_NUM_THREADS",
-):
-    os.environ.setdefault(var, "1")
-
-try:
-    from PIL import Image
-except ImportError:
-    Image = None
-
-
-INPUT_DIR = Path("input")
-GOOD_DIR = Path("good")
-BAD_DIR = Path("bad")
-
-SUPPORTED_EXTS = {
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".tif",
-    ".tiff",
-    ".dng",
-    ".bmp",
-    ".nef",
-    ".arw",
-    ".cr2",
-    ".cr3",
-}
-
-RAW_EXTS = {
-    ".nef",
-    ".arw",
-    ".cr2",
-    ".cr3",
-}
-
-ANCHOR_RATING = 1
-MAX_WORKERS = min(8, (os.cpu_count() or 4))
-
-PROCESS_TOOL = "barcode-changer"
-
-
-@dataclass
-class Photo:
-    path: Path
-    index: int
-    rating: Optional[int]
-    label: Optional[str]
-
-
-@dataclass
-class ProductSet:
-    photos: List[Photo]
-    anchor: Photo
-    barcode: Optional[str] = None
-    barcode_source_path: Optional[Path] = None
 
 
 def extractIndex(path: Path) -> int:
@@ -308,14 +326,12 @@ def loadPhotos() -> List[Photo]:
     photos: List[Photo] = []
     for p in files:
         meta = read_xmp_label(p)
-        rating, label = meta.rating, meta.label
-
         photos.append(
             Photo(
                 path=p,
                 index=extractIndex(p),
-                rating=rating,
-                label=label,
+                rating=meta.rating,
+                label=meta.label,
             )
         )
 
@@ -395,11 +411,9 @@ def build_product_sets(photos_in_order: List[Photo]) -> List[ProductSet]:
 def _try_decode_barcode(path: Path, *, require_large_region: bool) -> Optional[str]:
     scan_path, tmp_png = _prepare_scan_path(path)
     try:
-        with YOLO_LOCK:
-            status, code = readBarcode_hf_status(
-                str(scan_path),
-                require_large_region=require_large_region,
-            )
+        status, code = readBarcode_hf_status(
+            str(scan_path), require_large_region=require_large_region
+        )
         return code if status == BarcodeStatus.BARCODE and code else None
     finally:
         if tmp_png is not None and tmp_png.exists():
@@ -454,6 +468,24 @@ def _add_processed_tags_after_successful_rename(
 ) -> bool:
     processed_date = processed_date or date.today().isoformat()
 
+    # embed change
+    mode = (os.environ.get("BARCODE_XMP_MODE") or "embed").strip().lower()
+
+    if mode == "off":
+        return True
+
+    if mode == "sidecar":
+        ok = write_processed_xmp_sidecar(
+            image_path_in_good, tool=tool, processed_date=processed_date
+        )
+        if ok:
+            print(
+                f"[XMP] sidecar tagged: {image_path_in_good.name} (tool={tool} date={processed_date})"
+            )
+        else:
+            print(f"[XMP] FAILED sidecar tag: {image_path_in_good.name}")
+        return ok
+
     ok = write_processed_tags(
         image_path_in_good,
         tool=tool,
@@ -483,30 +515,17 @@ def rename_product_set(ps: ProductSet) -> Tuple[int, int]:
     processed_date = date.today().isoformat()
 
     for idx, ph in enumerate(ps.photos, start=1):
-        meta = read_xmp_label(ph.path)
-        _rating, label = meta.rating, meta.label
-
-        role, _r2, _l2, reason = role_from_xmp(ph.path)
-        token: Optional[str] = None
+        label = (ph.label or "").strip()
 
         mapped = token_from_color_label(label)
         if mapped:
             token = mapped
-
-        if not token and role:
-            token = str(role).strip().lower()
-
-        if not token and label:
-            token = str(label).strip().lower()
-            print(
-                f"[ROLE] No mapped color/role; using label fallback => {token} ({reason})"
-            )
-
-        if not token:
+        elif label:
+            token = label.strip().lower()
+            print(f"[ROLE] No mapped color; using label fallback => {token}")
+        else:
             token = f"img{idx:02d}"
-            print(
-                f"[ROLE] No xmp role/label; using ordinal fallback => {token} ({reason})"
-            )
+            print(f"[ROLE] No xmp label; using ordinal fallback => {token}")
 
         token = sanitizeStemToken(token).lower()
         dest = GOOD_DIR / f"{barcode}_{token}{ph.path.suffix.lower()}"
