@@ -458,8 +458,6 @@ def _add_processed_tags_after_successful_rename(
         image_path_in_good,
         tool=tool,
         processed_date=processed_date,
-        write_sidecar=True,
-        embed_jpeg=True,
     )
 
     if ok:
