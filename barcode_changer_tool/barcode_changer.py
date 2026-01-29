@@ -7,6 +7,10 @@ import threading
 import re
 import subprocess
 import time
+import json
+import getpass
+import urllib.request
+import urllib.error
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -20,6 +24,140 @@ from barcode_changer_tool.barcode_rename import (
     role_from_xmp,
     write_processed_tags,
 )
+
+TRACK_ENDPOINT = os.environ.get(
+    "BARCODE_TRACK_ENDPOINT", "https://sofiakris-barcodereader.hf.space/track"
+)
+
+KEYCHAIN_SERVICE = "barcode-changer-tracker"
+KEYCHAIN_ACCOUNT_HF = "hf_token"
+KEYCHAIN_ACCOUNT_TRACKER = "tracker_token"
+
+
+def _keychain_get(account: str) -> Optional[str]:
+    try:
+        res = subprocess.run(
+            [
+                "security",
+                "find-generic-password",
+                "-s",
+                KEYCHAIN_SERVICE,
+                "-a",
+                account,
+                "-w",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode != 0:
+            return None
+        return (res.stdout or "").strip() or None
+    except Exception:
+        return None
+
+
+def _keychain_set(account: str, secret: str) -> bool:
+    try:
+        subprocess.run(
+            [
+                "security",
+                "delete-generic-password",
+                "-s",
+                KEYCHAIN_SERVICE,
+                "-a",
+                account,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        res = subprocess.run(
+            [
+                "security",
+                "add-generic-password",
+                "-s",
+                KEYCHAIN_SERVICE,
+                "-a",
+                account,
+                "-w",
+                secret,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+def _ensure_tokens_or_prompt_once() -> Tuple[Optional[str], Optional[str]]:
+    hf_token = _keychain_get(KEYCHAIN_ACCOUNT_HF)
+    tracker_token = _keychain_get(KEYCHAIN_ACCOUNT_TRACKER)
+
+    env_hf = os.environ.get("HF_ACCESS_TOKEN")
+    env_tracker = os.environ.get("TRACKER_TOKEN")
+
+    if not hf_token and env_hf:
+        hf_token = env_hf.strip()
+        _keychain_set(KEYCHAIN_ACCOUNT_HF, hf_token)
+
+    if not tracker_token and env_tracker:
+        tracker_token = env_tracker.strip()
+        _keychain_set(KEYCHAIN_ACCOUNT_TRACKER, tracker_token)
+
+    if not hf_token:
+        print("[TRACK] Hugging Face access token not found in Keychain.")
+        hf_token = getpass.getpass("Enter Hugging Face access token (hf_...): ").strip()
+        if hf_token:
+            _keychain_set(KEYCHAIN_ACCOUNT_HF, hf_token)
+
+    if not tracker_token:
+        print("[TRACK] Tracker token not found in Keychain.")
+        tracker_token = getpass.getpass(
+            "Enter tracker token (hex / random string): "
+        ).strip()
+        if tracker_token:
+            _keychain_set(KEYCHAIN_ACCOUNT_TRACKER, tracker_token)
+
+    if not hf_token or not tracker_token:
+        print("[TRACK] Tracking disabled: missing token(s).")
+        return None, None
+
+    return hf_token, tracker_token
+
+
+def _post_run_counts(
+    *, hf_token: str, tracker_token: str, processed: int, unprocessed: int
+) -> None:
+    payload = json.dumps(
+        {"processed": int(processed), "unprocessed": int(unprocessed)}
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        TRACK_ENDPOINT,
+        data=payload,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {hf_token}",
+            "X-Tracker-Token": tracker_token,
+            "User-Agent": "barcode-changer/1.0",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            _ = resp.read()
+        print(
+            f"[TRACK] Sent counts to API: processed={processed}, unprocessed={unprocessed}"
+        )
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", errors="ignore")
+        except Exception:
+            body = ""
+        print(f"[TRACK] FAILED ({e.code}): {body[:120].strip()}")
+    except Exception as e:
+        print(f"[TRACK] FAILED: {type(e).__name__}: {e}")
+
 
 YOLO_LOCK = threading.Lock()
 
@@ -334,17 +472,21 @@ def _add_processed_tags_after_successful_rename(
     return ok
 
 
-def rename_product_set(ps: ProductSet):
+def rename_product_set(ps: ProductSet) -> Tuple[int, int]:
+    processed = 0
+    unprocessed = 0
+
     if not ps.barcode:
         move_set_to_bad(ps, reason="barcode_failed_for_entire_set")
-        return
+        unprocessed += len(ps.photos)
+        return processed, unprocessed
 
     barcode = sanitizeBarcodeForFileName(ps.barcode)
     processed_date = date.today().isoformat()
 
     for idx, ph in enumerate(ps.photos, start=1):
         meta = read_xmp_label(ph.path)
-        rating, label = meta.rating, meta.label
+        _rating, label = meta.rating, meta.label
 
         role, _r2, _l2, reason = role_from_xmp(ph.path)
         token: Optional[str] = None
@@ -373,11 +515,13 @@ def rename_product_set(ps: ProductSet):
 
         try:
             new_path = _safe_rename(ph.path, dest)
+            processed += 1
         except Exception as e:
             print(
                 f"[RENAME] ERROR: could not rename {ph.path.name}: {type(e).__name__}: {e}"
             )
             moveToBad(ph.path, reason="rename_failed")
+            unprocessed += 1
             continue
 
         _add_processed_tags_after_successful_rename(
@@ -386,8 +530,12 @@ def rename_product_set(ps: ProductSet):
             processed_date=processed_date,
         )
 
+    return processed, unprocessed
+
 
 def main():
+    hf_token, tracker_token = _ensure_tokens_or_prompt_once()
+
     t0 = time.time()
 
     photos = loadPhotos()
@@ -413,17 +561,37 @@ def main():
     )
     decode_barcodes_for_sets(all_sets)
 
-    good = 0
-    bad = 0
+    sets_with_barcode = 0
+    sets_without_barcode = 0
+
+    processed_images = 0
+    unprocessed_images = 0
+
     for ps in all_sets:
         if ps.barcode:
-            good += 1
+            sets_with_barcode += 1
         else:
-            bad += 1
-        rename_product_set(ps)
+            sets_without_barcode += 1
 
-    print(f"[INFO] Completed. Sets with decoded barcode: {good}, without: {bad}")
+        p, u = rename_product_set(ps)
+        processed_images += p
+        unprocessed_images += u
+
+    print(
+        f"[INFO] Completed. Sets with decoded barcode: {sets_with_barcode}, without: {sets_without_barcode}"
+    )
+    print(
+        f"[COUNT] Images processed: {processed_images}, unprocessed: {unprocessed_images}"
+    )
     print(f"[TOTAL] Finished in {time.time() - t0:.2f}s")
+
+    if hf_token and tracker_token:
+        _post_run_counts(
+            hf_token=hf_token,
+            tracker_token=tracker_token,
+            processed=processed_images,
+            unprocessed=unprocessed_images,
+        )
 
 
 if __name__ == "__main__":
