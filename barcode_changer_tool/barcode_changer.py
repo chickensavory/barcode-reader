@@ -154,7 +154,7 @@ def _post_run_counts(
             body = e.read().decode("utf-8", errors="ignore")
         except Exception:
             body = ""
-        print(f"[TRACK] FAILED ({e.code}): {body[:120].strip()}")
+        print(f"[TRACK] FAILED ({e.code}): {body[:700].strip()}")
     except Exception as e:
         print(f"[TRACK] FAILED: {type(e).__name__}: {e}")
 
