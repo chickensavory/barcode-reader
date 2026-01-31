@@ -196,10 +196,10 @@ def _zxing_decode(img_bgr: np.ndarray) -> Optional[str]:
 
 
 def yolo_detect_boxes(
-    image_path: Union[str, Path], conf: float = YOLO_CONF
+    source: Union[str, Path, np.ndarray], conf: float = YOLO_CONF
 ) -> Tuple[np.ndarray, np.ndarray]:
     with YOLO_LOCK:
-        res = YOLO_MODEL.predict(str(image_path), conf=conf, verbose=False)[0]
+        res = YOLO_MODEL.predict(source=source, conf=conf, verbose=False)[0]
     boxes = res.boxes
     if boxes is None or len(boxes) == 0:
         return np.zeros((0, 4), dtype=int), np.zeros((0,), dtype=float)
@@ -234,7 +234,7 @@ def readBarcode_hf_status(
     if code:
         return BarcodeStatus.BARCODE, code
 
-    xyxy, confs = yolo_detect_boxes(image_path, conf=YOLO_CONF)
+    xyxy, confs = yolo_detect_boxes(img, conf=YOLO_CONF)
     if xyxy.shape[0] == 0:
         return BarcodeStatus.NONBARCODE, None
 

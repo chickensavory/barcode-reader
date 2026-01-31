@@ -13,9 +13,10 @@ import urllib.request
 import urllib.error
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
+from uuid import uuid4
 
 from barcode_changer_tool.barcode_reader import readBarcode_hf_status, BarcodeStatus
 from barcode_changer_tool.barcode_rename import (
@@ -79,6 +80,33 @@ ANCHOR_RATING = 1
 MAX_WORKERS = min(8, (os.cpu_count() or 4))
 
 PROCESS_TOOL = "barcode-changer"
+
+PROCESSED_FILES: List[Dict[str, str]] = []
+UNPROCESSED_FILES: List[Dict[str, str]] = []
+
+
+def _record_processed(*, src: str, dest: str) -> None:
+    PROCESSED_FILES.append({"src": src, "dest": dest})
+
+
+def _record_unprocessed(*, src: str, dest: str, reason: str) -> None:
+    UNPROCESSED_FILES.append({"src": src, "dest": dest, "reason": reason})
+
+
+def _print_run_report_json(processed: int, unprocessed: int, run_id: str) -> None:
+    report = {
+        "run_id": run_id,
+        "processed": int(processed),
+        "unprocessed": int(unprocessed),
+        "processed_files": PROCESSED_FILES,
+        "unprocessed_files": UNPROCESSED_FILES,
+    }
+    print("[REPORT] " + json.dumps(report, ensure_ascii=False))
+
+
+def _chunks(items: List[Dict[str, Any]], chunk_size: int):
+    for i in range(0, len(items), chunk_size):
+        yield items[i : i + chunk_size]
 
 
 @dataclass
@@ -152,25 +180,6 @@ def _keychain_set(account: str, secret: str) -> bool:
         return False
 
 
-def _keychain_delete(account: str) -> bool:
-    try:
-        res = subprocess.run(
-            [
-                "security",
-                "delete-generic-password",
-                "-s",
-                KEYCHAIN_SERVICE,
-                "-a",
-                account,
-            ],
-            capture_output=True,
-            text=True,
-        )
-        return res.returncode == 0
-    except Exception:
-        return False
-
-
 def _ensure_tokens_or_prompt_once() -> Tuple[Optional[str], Optional[str]]:
     hf_token = _keychain_get(KEYCHAIN_ACCOUNT_HF)
     tracker_token = _keychain_get(KEYCHAIN_ACCOUNT_TRACKER)
@@ -207,15 +216,13 @@ def _ensure_tokens_or_prompt_once() -> Tuple[Optional[str], Optional[str]]:
     return hf_token, tracker_token
 
 
-def _post_run_counts(
-    *, hf_token: str, tracker_token: str, processed: int, unprocessed: int
+def _http_post_json(
+    *, hf_token: str, tracker_token: str, payload: Dict[str, Any]
 ) -> None:
-    payload = json.dumps(
-        {"processed": int(processed), "unprocessed": int(unprocessed)}
-    ).encode("utf-8")
+    data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         TRACK_ENDPOINT,
-        data=payload,
+        data=data,
         method="POST",
         headers={
             "Content-Type": "application/json",
@@ -224,19 +231,45 @@ def _post_run_counts(
             "User-Agent": "barcode-changer/1.0",
         },
     )
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        _ = resp.read()
+
+
+def _post_run(
+    *,
+    hf_token: str,
+    tracker_token: str,
+    processed: int,
+    unprocessed: int,
+    run_id: str,
+    processed_files: List[Dict[str, str]],
+    unprocessed_files: List[Dict[str, str]],
+) -> None:
+    payload: Dict[str, Any] = {
+        "run_id": run_id,
+        "processed": int(processed),
+        "unprocessed": int(unprocessed),
+        "processed_files": processed_files,
+        "unprocessed_files": unprocessed_files,
+    }
 
     try:
-        with urllib.request.urlopen(req, timeout=6) as resp:
-            _ = resp.read()
+        _http_post_json(
+            hf_token=hf_token,
+            tracker_token=tracker_token,
+            payload=payload,
+        )
         print(
-            f"[TRACK] Sent counts to API: processed={processed}, unprocessed={unprocessed}"
+            f"[TRACK] Sent run {run_id}: "
+            f"processed={processed}, unprocessed={unprocessed}, "
+            f"files={len(processed_files) + len(unprocessed_files)}"
         )
     except urllib.error.HTTPError as e:
         try:
             body = e.read().decode("utf-8", errors="ignore")
         except Exception:
             body = ""
-        print(f"[TRACK] FAILED ({e.code}): {body[:700].strip()}")
+        print(f"[TRACK] FAILED ({e.code}): {body[:800].strip()}")
     except Exception as e:
         print(f"[TRACK] FAILED: {type(e).__name__}: {e}")
 
@@ -339,7 +372,7 @@ def loadPhotos() -> List[Photo]:
     return photos
 
 
-def moveToBad(path: Path, reason: str = ""):
+def moveToBad(path: Path, reason: str = "") -> Path:
     BAD_DIR.mkdir(parents=True, exist_ok=True)
     dest = BAD_DIR / path.name
     i = 1
@@ -350,7 +383,12 @@ def moveToBad(path: Path, reason: str = ""):
     if reason:
         msg += f" ({reason})"
     print(msg)
+
+    src_name = path.name
     path.rename(dest)
+
+    _record_unprocessed(src=src_name, dest=dest.name, reason=reason or "moved_to_bad")
+    return dest
 
 
 def move_set_to_bad(ps: ProductSet, reason: str):
@@ -468,7 +506,6 @@ def _add_processed_tags_after_successful_rename(
 ) -> bool:
     processed_date = processed_date or date.today().isoformat()
 
-    # embed change
     mode = (os.environ.get("BARCODE_XMP_MODE") or "embed").strip().lower()
 
     if mode == "off":
@@ -530,9 +567,11 @@ def rename_product_set(ps: ProductSet) -> Tuple[int, int]:
         token = sanitizeStemToken(token).lower()
         dest = GOOD_DIR / f"{barcode}_{token}{ph.path.suffix.lower()}"
 
+        src_name = ph.path.name
         try:
             new_path = _safe_rename(ph.path, dest)
             processed += 1
+            _record_processed(src=src_name, dest=new_path.name)
         except Exception as e:
             print(
                 f"[RENAME] ERROR: could not rename {ph.path.name}: {type(e).__name__}: {e}"
@@ -551,7 +590,12 @@ def rename_product_set(ps: ProductSet) -> Tuple[int, int]:
 
 
 def main():
+    PROCESSED_FILES.clear()
+    UNPROCESSED_FILES.clear()
+
     hf_token, tracker_token = _ensure_tokens_or_prompt_once()
+
+    run_id = str(uuid4())
 
     t0 = time.time()
 
@@ -602,12 +646,17 @@ def main():
     )
     print(f"[TOTAL] Finished in {time.time() - t0:.2f}s")
 
+    _print_run_report_json(processed_images, unprocessed_images, run_id)
+
     if hf_token and tracker_token:
-        _post_run_counts(
+        _post_run(
             hf_token=hf_token,
             tracker_token=tracker_token,
             processed=processed_images,
             unprocessed=unprocessed_images,
+            run_id=run_id,
+            processed_files=PROCESSED_FILES,
+            unprocessed_files=UNPROCESSED_FILES,
         )
 
 
