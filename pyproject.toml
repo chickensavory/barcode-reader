@@ -9,12 +9,12 @@ description = "CLI tool to read and change barcodes in image pairs from an input
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
-  "opencv-python==4.8.1.78",
-  "numpy==1.24.4",
-  "huggingface_hub==0.20.3",
-  "ultralytics==8.0.228",
-  "rawpy==0.22.0",
-  "imageio==2.31.6",
+  "opencv-python",
+  "numpy",
+  "huggingface_hub",
+  "ultralytics",
+  "rawpy",
+  "imageio",
   "zxing-cpp==2.3.0",
   "pyrxing",
 ]
