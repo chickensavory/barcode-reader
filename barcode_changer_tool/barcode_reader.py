@@ -32,7 +32,6 @@ ALLOWED_ZX_FORMATS: Set[zxingcpp.BarcodeFormat] = {
     zxingcpp.BarcodeFormat.ITF,
 }
 
-# TODO MAKE SURE DEPENDENCIES STAY ON 3.9
 
 class BarcodeStatus(str, Enum):
     BARCODE = "BARCODE"

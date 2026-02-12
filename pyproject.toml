@@ -12,11 +12,11 @@ dependencies = [
   "opencv-python==4.8.1.78",
   "numpy==1.24.4",
   "huggingface_hub==0.20.3",
-  "pyrxing==0.0.21",
   "ultralytics==8.0.228",
   "rawpy==0.18.1",
   "imageio==2.31.6",
   "zxing-cpp==2.3.0",
+  "pyrxing",
 ]
 
 [project.scripts]
