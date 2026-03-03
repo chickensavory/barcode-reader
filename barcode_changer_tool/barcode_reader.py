@@ -30,6 +30,8 @@ ALLOWED_ZX_FORMATS: Set[zxingcpp.BarcodeFormat] = {
     zxingcpp.BarcodeFormat.EAN8,
     zxingcpp.BarcodeFormat.UPCA,
     zxingcpp.BarcodeFormat.ITF,
+    zxingcpp.BarcodeFormat.UPCE,
+    zxingcpp.BarcodeFormat.Code128,
 }
 
 
@@ -72,6 +74,30 @@ def _upc_a_checksum_ok(code: str) -> bool:
     return check == digits[11]
 
 
+def _expand_upc_e_to_a(code: str) -> str:
+    ns = code[0]
+    d1, d2, d3, d4, d5, d6 = code[1:7]
+    check = code[7]
+
+    if d6 in "012":
+        upc_a = f"{ns}{d1}{d2}{d6}0000{d3}{d4}{d5}{check}"
+    elif d6 == "3":
+        upc_a = f"{ns}{d1}{d2}{d3}00000{d4}{d5}{check}"
+    elif d6 == "4":
+        upc_a = f"{ns}{d1}{d2}{d3}{d4}00000{d5}{check}"
+    else:
+        upc_a = f"{ns}{d1}{d2}{d3}{d4}{d5}0000{d6}{check}"
+
+    return upc_a
+
+
+def _upc_e_checksum_ok(code: str) -> bool:
+    if len(code) != 8 or not code.isdigit():
+        return False
+    upc_a = _expand_upc_e_to_a(code)
+    return _upc_a_checksum_ok(upc_a)
+
+
 def _ean13_checksum_ok(code: str) -> bool:
     if len(code) != 13 or not code.isdigit():
         return False
@@ -111,6 +137,25 @@ def _gtin14_checksum_ok(code: str) -> bool:
     return check == check_digit
 
 
+def is_valid_digit_code(fmt: zxingcpp.BarcodeFormat, code: str) -> bool:
+    if not code or not code.isdigit():
+        return False
+
+    if fmt == zxingcpp.BarcodeFormat.UPCA:
+        return len(code) == 12 and _upc_a_checksum_ok(code)
+
+    if fmt == zxingcpp.BarcodeFormat.EAN13:
+        return len(code) == 13 and _ean13_checksum_ok(code)
+
+    if fmt == zxingcpp.BarcodeFormat.EAN8:
+        return len(code) == 8 and _ean8_checksum_ok(code)
+
+    if fmt == zxingcpp.BarcodeFormat.UPCE:
+        return len(code) == 8 and _upc_e_checksum_ok(code)
+
+    return False
+
+
 def is_valid_upc_ean(code: str) -> bool:
     if not code or not code.isdigit():
         return False
@@ -118,8 +163,6 @@ def is_valid_upc_ean(code: str) -> bool:
         return _upc_a_checksum_ok(code)
     if len(code) == 13:
         return _ean13_checksum_ok(code)
-    if len(code) == 8:
-        return _ean8_checksum_ok(code)
     if len(code) == 14:
         return _gtin14_checksum_ok(code)
     return False
@@ -166,7 +209,9 @@ def _iter_preprocessed_grays_fast(img_bgr: np.ndarray):
     yield otsu_blur
 
 
-def _zxing_decode(img_bgr: np.ndarray) -> Optional[str]:
+def _zxing_decode(
+    img_bgr: np.ndarray,
+) -> Optional[Tuple[zxingcpp.BarcodeFormat, str, bool]]:
     if img_bgr is None or img_bgr.size == 0:
         return None
 
@@ -177,29 +222,53 @@ def _zxing_decode(img_bgr: np.ndarray) -> Optional[str]:
             continue
 
         for res in results:
-            if not getattr(res, "valid", True):
-                continue
-
             fmt = getattr(res, "format", None)
             if fmt is not None and fmt not in ALLOWED_ZX_FORMATS:
                 continue
 
-            raw = (res.text or "").strip()
+            raw = (getattr(res, "text", "") or "").strip()
             if not raw:
                 continue
 
-            cand = extract_upc_candidate(raw)
-            if cand and is_valid_upc_ean(cand):
-                return cand
+            is_valid = bool(getattr(res, "valid", True))
+            if not is_valid:
+                continue
+
+            return fmt, raw, is_valid
+
+    return None
+
+
+def _accept_decoded(
+    fmt: zxingcpp.BarcodeFormat, raw: str, is_valid: bool
+) -> Optional[str]:
+    cand = extract_upc_candidate(raw)
+
+    if cand:
+        if fmt in {
+            zxingcpp.BarcodeFormat.UPCA,
+            zxingcpp.BarcodeFormat.EAN13,
+            zxingcpp.BarcodeFormat.EAN8,
+            zxingcpp.BarcodeFormat.UPCE,
+        }:
+            return cand if is_valid_digit_code(fmt, cand) else None
+
+        if len(cand) == 14:
+            return cand if _gtin14_checksum_ok(cand) else None
+
+        return cand if is_valid_upc_ean(cand) else None
+
+    if fmt in {zxingcpp.BarcodeFormat.Code128, zxingcpp.BarcodeFormat.ITF}:
+        return raw if is_valid else None
 
     return None
 
 
 def yolo_detect_boxes(
-    source: Union[str, Path, np.ndarray], conf: float = YOLO_CONF
+    image_path: Union[str, Path], conf: float = YOLO_CONF
 ) -> Tuple[np.ndarray, np.ndarray]:
     with YOLO_LOCK:
-        res = YOLO_MODEL.predict(source=source, conf=conf, verbose=False)[0]
+        res = YOLO_MODEL.predict(str(image_path), conf=conf, verbose=False)[0]
     boxes = res.boxes
     if boxes is None or len(boxes) == 0:
         return np.zeros((0, 4), dtype=int), np.zeros((0,), dtype=float)
@@ -212,9 +281,13 @@ def yolo_detect_boxes(
 
 def _decode_with_angles(img_bgr: np.ndarray) -> Optional[str]:
     for a in ANGLES:
-        code = _zxing_decode(_rotate(img_bgr, a))
-        if code:
-            return code
+        hit = _zxing_decode(_rotate(img_bgr, a))
+        if not hit:
+            continue
+        fmt, raw, is_valid = hit
+        out = _accept_decoded(fmt, raw, is_valid)
+        if out:
+            return out
     return None
 
 
@@ -234,7 +307,7 @@ def readBarcode_hf_status(
     if code:
         return BarcodeStatus.BARCODE, code
 
-    xyxy, confs = yolo_detect_boxes(img, conf=YOLO_CONF)
+    xyxy, confs = yolo_detect_boxes(image_path, conf=YOLO_CONF)
     if xyxy.shape[0] == 0:
         return BarcodeStatus.NONBARCODE, None
 
