@@ -242,26 +242,35 @@ def _zxing_decode(
 def _accept_decoded(
     fmt: zxingcpp.BarcodeFormat, raw: str, is_valid: bool
 ) -> Optional[str]:
+    if not raw or not is_valid:
+        return None
+
+    raw = raw.strip()
+    if not raw:
+        return None
+
+    if fmt in {
+        zxingcpp.BarcodeFormat.UPCA,
+        zxingcpp.BarcodeFormat.EAN13,
+        zxingcpp.BarcodeFormat.EAN8,
+        zxingcpp.BarcodeFormat.UPCE,
+    }:
+        cand = extract_upc_candidate(raw)
+        if not cand:
+            return None
+        return cand if is_valid_digit_code(fmt, cand) else None
+
+    if fmt == zxingcpp.BarcodeFormat.Code128:
+        return raw
+
+    if fmt == zxingcpp.BarcodeFormat.ITF:
+        return raw
+
     cand = extract_upc_candidate(raw)
+    if cand and is_valid_upc_ean(cand):
+        return cand
 
-    if cand:
-        if fmt in {
-            zxingcpp.BarcodeFormat.UPCA,
-            zxingcpp.BarcodeFormat.EAN13,
-            zxingcpp.BarcodeFormat.EAN8,
-            zxingcpp.BarcodeFormat.UPCE,
-        }:
-            return cand if is_valid_digit_code(fmt, cand) else None
-
-        if len(cand) == 14:
-            return cand if _gtin14_checksum_ok(cand) else None
-
-        return cand if is_valid_upc_ean(cand) else None
-
-    if fmt in {zxingcpp.BarcodeFormat.Code128, zxingcpp.BarcodeFormat.ITF}:
-        return raw if is_valid else None
-
-    return None
+    return raw
 
 
 def yolo_detect_boxes(

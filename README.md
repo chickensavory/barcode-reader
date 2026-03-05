@@ -174,4 +174,4 @@ https://www.python.org/downloads/macos/
 ---
 
 ## Change Log
-03 - 03 - 26 : Added Code-128, UPC-E support
+03 - 03 - 26 : Added Code-128 and UPC-E support
