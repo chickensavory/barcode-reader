@@ -565,7 +565,7 @@ def rename_product_set(ps: ProductSet) -> Tuple[int, int]:
             print(f"[ROLE] No xmp label; using ordinal fallback => {token}")
 
         token = sanitizeStemToken(token).lower()
-        dest = GOOD_DIR / f"{barcode}_{token}{ph.path.suffix.lower()}"
+        dest = GOOD_DIR / f"{barcode}-{token}{ph.path.suffix.lower()}"
 
         src_name = ph.path.name
         try:
